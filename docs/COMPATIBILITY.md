@@ -496,6 +496,55 @@ Model-aware routing is positively supported **only** on the deterministic driver
 the request leg is honest: the reference driver records a requested model against the
 session and reads that state back, composing no command and parsing no output.
 
+**OS-14 — the normal workflow now performs the preparation itself, and it is DURABLY
+recorded.** Before OS-14 the public pre-pass that admits a same-command pair had no caller
+under `scripts/deterministic_workflow/`: only tests created both sessions and pre-admitted
+the pair. The Orca-adapter workflow path now prepares both sessions, verifies both model
+identities through the injected driver seam, and only then delivers the first task — and a
+preparation or verification failure delivers **nothing**, for either role. The preparation's
+provenance is durable, so re-entry and restart either continue with **no duplicate effect**
+or stop with a named `PAIR_PREPARATION_*` reason. None of this changes the fail-closed
+default above: with no driver a declared model is still refused `AGENT_MODEL_NOT_SUPPORTED`
+at the declaration gate, before any Run exists, and the reference driver's success remains
+evidence about the **wiring** only — never about any real provider model.
+
+**Every Orca-adapter run now carries a run-root launch record**
+(`.pair_launch_binding.json`), written at run OPEN, model-less runs included, with
+`model_aware` recorded as the string `"true"` or `"false"`. The file's EXISTENCE is not the
+signal — its content is — so an absent record can never be mistaken for a legacy run. A run
+opened by a **pre-feature** engine therefore has none, and adopting it stops by name
+(`PAIR_PREPARATION_LAUNCH_RECORD_ABSENT`); the operator relaunches it, and nothing was
+prepared under it, so no prepared session is orphaned. An adoption never WRITES a launch
+record, so it cannot manufacture the authority it is supposed to be checked against. A
+relaunch of the **same run id** under a **different** routing or launch kind is refused at
+the launch boundary as `ORCA_RUN_BINDING_CONFLICT`, before any Task exists.
+
+**The launch identity a successor is reconciled against includes the DRIVER CLASS.** The
+record binds the driver's layout-normalised, round-trip-verified import path
+(`"<module>:<qualname>"`), not its short `__name__`, which two different classes can share.
+A successor that reconstructs the same routing digest but injects a *different* capable
+driver class — including one whose `__name__` is identical — is refused
+`PAIR_PREPARATION_BINDING_MISMATCH` before any effect. A driver whose class has **no durable
+name** (a function-local class, a `type("X", …)` built at run time) cannot open a model-aware
+run at all: `AGENT_MODEL_DRIVER_UNIDENTIFIABLE`, at the routing gate, before a harness, Run,
+Task, Dispatch or terminal exists. A driver's **injected behaviour** is explicitly NOT
+bindable — a live callable has no stable durable identity — and is covered instead by
+mandatory fresh re-verification on every pass plus the cross-process drift block
+(`PAIR_PREPARATION_MODEL_DRIFT`).
+
+**Automatic resume is not guaranteed at every crash window, and a named block is the
+designed outcome** wherever creation, ownership, configuration or verification state is
+unknown. A `VERIFIED` record is **never** restored as a current verification: authority lives
+only in process memory, `resume_run` restores none of it, and every preparation pass re-runs
+the driver's two legs for both roles. A model-aware adoption also reconstructs its routing
+from the run's **own committed declaration** — its requested phases and its risk, from one
+read — and refuses `ORCA_RUN_DECLARATION_UNREADABLE` rather than guessing; a **legacy**
+adoption never performs that read and behaves exactly as it does today. One pre-OS-14
+behaviour is deliberately replaced: a **resumed model-aware** run used to deliver
+**unverified**, because the shipped recovery constructor reconstructed neither routing nor
+driver; it now stops `PAIR_PREPARATION_BINDING_UNVERIFIABLE` before any Task, terminal or
+Dispatch.
+
 ### Worker/Reviewer independence is admitted as a PAIR, before the first delivery
 
 `requested` is a **declaration**, not an observation, so two distinct declared models on one
@@ -560,6 +609,29 @@ risk the Reviewer entry exists but is optional and no Reviewer is ever dispatche
 is no pair to admit and a LOW-risk model-aware Worker routes unchanged — the same rule the
 PATH check follows: a role nobody dispatches must not fail a run. An unresolved *required*
 role is still `AGENT_ROLE_UNRESOLVED`'s business, not this gate's.
+
+**OS-14 — who performs the pair admission.** The lifecycle above is now executed by the
+Orca-adapter workflow path itself, inside `OrcaAdapter.start` and strictly before the Task
+is created: it prepares both sessions, verifies both identities, and refuses the whole
+attempt if either half fails. The predicate that decides whether a delivery needs an
+admitted pair is a single public derivation on the harness
+(`OrcaRuntimeHarness.pair_admission_required`), read by the adapter and copied nowhere, and
+the same-command condition it rests on is one private helper read by all three of its call
+sites — so the declaration gate, the delivery barrier's backstop and the workflow path
+cannot disagree about which pairs the rule covers.
+
+**Reviewer SESSION preparation is distinct from Reviewer TASK execution.** The Reviewer's
+session is brought up with the Worker's, before the first delivery, because that is what
+pair admission requires. Its **Task**, **Dispatch** and `worker-start` appear only at the
+Reviewer's own graph turn, after the Worker's result has been applied — no dependency is
+bypassed and nothing is force-ready. A correction or re-review round is a different gate
+round, prepares a **fresh** pair under its own key, and is admitted only on evidence
+re-earned during that round.
+
+**Unaffected: distinct-command and LOW-risk model-aware runs, and model-less runs.** None of
+them has a pair to admit, so none of them prepares anything: the command sequence is
+byte-identical to before OS-14, with the single run-root launch record described in the
+fail-closed section as the only delta.
 
 ### Session reuse is model-bound
 
@@ -640,6 +712,24 @@ that run at all. This can refuse nothing a same-run pair did before — a same-r
 
 ### What remains for OS-14
 
+OS-14 is split into two tracks, and only one of them is implemented.
+
+**TRACK A — implemented.** The common Worker/Reviewer pair preparation described above:
+preparation, dual verification and pair admission performed by the normal Orca-adapter
+workflow, with durable preparation provenance, re-entry/restart guarantees and named
+fail-closed refusals. It is driven by the **reference** driver, which is evidence about the
+wiring only.
+
+**TRACK B — DESIGN ONLY, nothing implemented.** `docs/OS-14-claude-driver-design.md` is the
+design for a real Claude Code model-selection driver: request semantics, evidence and
+validity windows, execution lifetime, and the attachment target, together with the coupled
+code boundaries and the decisions that remain open. **No real driver, no interactive
+model-switch experiment and no company-environment work is implemented by it**, and a
+declared model on a real placement stays refused exactly as the fail-closed section above
+states.
+
+The items below remain open for a real environment:
+
 - company-environment verification of model-aware routing; **nothing here claims it**
 - which of GLM-5.2 and GLM-5.3-flash should be Worker and which Reviewer
 - the real shape of a launch receipt's effective-model field (unobserved; nothing depends on it)
@@ -648,3 +738,312 @@ that run at all. This can refuse nothing a same-run pair did before — a same-r
 - whether `claude-gemma` leaves `known_agent_commands` (unchanged by OS-49)
 - the first adapter or driver that can **honestly declare both legs** in a real environment,
   which is the one thing that lifts OS-49's fail-closed refusal for a real run
+
+## OS-14 correction run — session use state, durable model history, preparation-record loss
+
+This section records the three independent-review findings corrected after PR #38's first
+green run, the two schema versions that move with them, and the operator procedures the
+new refusals need. Nothing here is evidence about any real Claude or company model: the
+pair-preparation path is still driven by the **reference** driver, and TRACK B of OS-14 is
+still design only.
+
+### Two schema versions move (breaking for in-flight model-aware runs)
+
+| Document | Was | Now |
+| --- | --- | --- |
+| `.pair_launch_binding.json` | `os14.pair_launch_binding.v1` | `os14.pair_launch_binding.v2` |
+| `.pair_preparation.json` | `os14.pair_preparation.v1` | `os14.pair_preparation.v3` |
+
+A document at the older version is refused as `PAIR_PREPARATION_RECORD_CORRUPT`
+(`INCOMPATIBLE_DURABLE_STORE`) and is **never** read as "nothing was prepared", "a legacy
+run" or "an unused session". That is the fail-closed direction and it is required rather
+than incidental: the v1 entry shape carries no statement about whether a prepared session
+was ever delivered to and no run-scoped model baseline, so reading a v1 document under the
+new rules would answer "unused" and "no baseline" for facts it never recorded — which is
+exactly the two defects being fixed.
+
+**Drain in-flight model-aware runs before upgrading.** A run whose preparation document
+was written by the previous build must be restarted, not resumed; see the transition
+procedure below. No migration shim is provided, for the same reason OS-42 provides none: a
+shim would have to invent a use state and a model baseline for sessions whose history was
+never recorded.
+
+`PAIR_LAUNCH_IDENTITY_KEYS` gains **no** cell. The new binding cell
+`preparation_started_at` is provenance, excluded from the launch identity by construction,
+so setting it can never make a run's own binding mismatch itself.
+
+**A present v2 document's top-level section set is exact.** `.pair_preparation.json` has
+exactly three sections — `pairs`, `sessions`, `role_history` — and the single writer emits
+all three on every write. An **unknown** top-level key was already corruption; a
+**missing** one now is too, refused as `PAIR_PREPARATION_RECORD_CORRUPT` before any
+section is interpreted, and therefore before any session creation, Task creation or
+delivery. The reason is the same fail-closed reason as the version bump: read permissively,
+a removed `sessions` section answers "this session was never delivered to" and a removed
+`role_history` section answers "this role has no baseline, so a first observation may
+establish one" — the two statements a *missing* record must never make. An **absent file**
+is a different state and keeps its own path: there is no document for a section to be
+missing from, and whether that absence is a genuine first write or a lost document is
+decided by the launch record's `preparation_started_at` marker (B3), not by the reader.
+
+### Session use state (B1): what a prepared session's use record states
+
+Session use is recorded in the `sessions` section of `.pair_preparation.json`, keyed by the
+session's **terminal digest** — the only key that denotes one physical session across
+processes — and it is **append-only**. A new `create_attempt` on a preparation entry
+therefore cannot overwrite the past use state, or the refusal grounds, of the session it
+replaces.
+
+| Recorded state | Read as | What may happen |
+| --- | --- | --- |
+| no row, and no entry claims one | UNUSED | first delivery proceeds, as before |
+| no row, but an entry **claims** one | RECORD LOST | `PAIR_PREPARATION_RECORD_CORRUPT` (`PAIR_SESSION_USE_RECORD_LOST`) |
+| `DELIVERY_INTENDED` (no `dispatch_id`) | USED, OUTCOME UNKNOWN | `PAIR_PREPARATION_SESSION_USE_UNKNOWN` |
+| `DELIVERED` with a `dispatch_id` | USED | re-delivery **only** if the shipped reuse gate permits it |
+
+**What makes "no row" a positive statement, exactly.** Two invariants, not one, and the
+second was added in correction round 2 after the Final Adversarial Review reproduced its
+absence:
+
+1. the writer records `DELIVERY_INTENDED` strictly **before** the delivery, so a delivery
+   that happened has a row; and
+2. every row the writer creates is **claimed** by the pair entry it was written for — the
+   entry cell `session_use_digests`, comma-joined and append-only — and the claim and the
+   row are published by **one** atomic document write, so "a claim exists and its row does
+   not" cannot be produced by any interleaving of the writers, not even by a crash between
+   two writes, because there is only one write. `_read_document` refuses the **whole**
+   document when a claimed row is gone.
+
+The first invariant alone was not enough and the review proved it: with all three sections
+present and every other row intact, removing one required per-digest row still made the
+reader answer "this session was never delivered to" for an already-delivered session, so a
+validation repair re-delivered to it without the reuse gate being asked and the run reached
+`COMPLETED`. A section's presence says nothing about its rows.
+
+The claim lives on the **entry**, not in a sibling section, so it cannot be lost
+independently of the entry whose session it is about; it is **monotone** (a superseding
+`create_attempt` adds its new digest and keeps the superseded one's, and
+`_PAIR_ENTRY_ATTEMPT_CLEARED` does not touch it); and it does **not** misclassify a
+genuinely prepared-but-undispatched session, which has no row because none was ever
+written, so nothing claims it and nothing is missing.
+
+A lost row is reported under the established, closed `PAIR_PREPARATION_RECORD_CORRUPT`
+name — exactly as a removed **section** is — with the specific record named in the
+message; the adapter's closed refusal-code set deliberately gained no member. Internally it
+is its own exception class, `PairSessionUseRecordLost`, a subclass of
+`PairPreparationCorrupt`, so every caller that already fails closed on an unreadable
+document fails closed on a lost row too, unchanged.
+
+Because the entry gained a cell, a `.pair_preparation.json` written before this round holds
+use rows that no entry claims — so **its** missing rows would be undetectable. That is why
+the preparation schema version moved a second time, to
+`os14.pair_preparation.v3`: such a document is refused outright rather than read.
+
+Re-use of a used session is decided by the shipped gate and by nothing else:
+`OrcaRuntimeHarness.terminal_for_next_dispatch`, which is `reuse_eligible()`'s one
+production consumer, asks all nine conditions with a **fresh** liveness observation and
+includes the OS-49 model reuse conditions. A digest match, an adoption, and this round's
+model re-verification are each **not** a reuse permission. When the gate refuses — or
+cannot be asked, or its observation cannot be read — the run prepares a **new** session
+recorded as a new `create_attempt` carrying `supersedes_digest` and `supersedes_reason`
+(the gate's own condition names), and the superseded session is left alone.
+
+Only the role this dispatch is about to deliver to is put through the gate. The
+counterpart role of the same gate round is adopted for verification, because OS-49 pair
+admission requires both sessions verified before the first delivery of either; it is not a
+delivery target and is therefore not a reuse candidate.
+
+### Durable model history (B2): the run-scoped non-drift baseline
+
+The `role_history` section of `.pair_preparation.json` holds one **write-once** row per
+`(phase, role)` for the whole run — deliberately not per gate iteration, which is the
+scope the in-memory `_model_role_history` had and the durable record did not.
+
+- The baseline is **history, never authority.** Nothing reads it to decide that a session
+  *is* verified. It is read only to **refuse a change**. Current verification authority is
+  earned only by a positive re-verification through the live driver.
+- It is compared **before** a new identity is left in an approved state and **before** the
+  Task is created: the comparison runs inside pair preparation, which is strictly before
+  `create_task`. Since correction round 2 the **row-presence reconciliation** below runs
+  earlier still — before the first `terminal list`, the first `terminal create`, the first
+  adoption and the first `verify_model_identity` of the round, so a refusal on that path
+  creates no session at all.
+- On refusal **after selection** the session's current authority is **revoked**
+  (`OrcaRuntimeHarness.invalidate_model_authority`, the public name of the existing
+  `_stale_model_evidence`) and the history is **preserved**. Selection is the act that
+  switches the session, so a post-selection refusal must not leave it advertising a
+  verification that was just rejected. The reconciliation path needs no revocation: it
+  runs before any session exists, so there is no authority yet to revoke.
+- A **missing or contradictory** baseline is `PAIR_PREPARATION_MODEL_HISTORY_CONFLICT`,
+  never an opportunity to mint a new one. The baseline row is written **before** every
+  entry observation, so an observation standing with no row behind it means a required
+  record is gone.
+- **Which observations count: every gate iteration of the run, not only the current one.**
+  Correction round 2's correction, after the Final Adversarial Review reproduced the gap.
+  Reading the baseline row against the *current* entry alone made the row's own presence
+  uncheckable precisely at an iteration boundary, where the current entry is legitimately
+  absent: with the `role_history` **section** present and only the one required row
+  removed, both legs read empty although the previous iteration's `VERIFIED` entry proved,
+  on the same disk, that a baseline had been established — and the drifted identity was
+  then minted as the new write-once baseline, stored as a `VERIFIED` observation, and the
+  row recreated with `first_gate_iteration` pointing at the later iteration. The row is now
+  reconciled against **every** entry for the same `(run, phase, role)` in `pairs`
+  (`FilePairPreparationStore.role_observations`), and any observation standing with no row,
+  or disagreeing with it, is that named refusal.
+- A **genuinely new run** gets an independent baseline: the document is run-scoped and
+  every row carries its run id, so a role may resolve to a different model in a new run.
+  The cross-iteration reconciliation is run-scoped for the same reason — it reads only the
+  entries of the document under that run's own root.
+- The narrower per-iteration leg (`resolved_model_observed` on the entry) is retained and
+  still compared. It is never cleared by a new `create_attempt`.
+
+### Preparation-record loss (B3): an absent record is not a first preparation
+
+`.pair_launch_binding.json` carries a one-way `preparation_started_at` marker, set once by
+the preparation path strictly **before** the run's first `CREATE_INTENDED` entry. Because a
+`CREATE_INTENDED` is itself written strictly before every `terminal create`:
+
+- marker **absent** → no entry was ever written → no session was ever created → a genuine
+  first preparation, which proceeds exactly as before;
+- marker **present** and the preparation document holds **no entry at all** → an entry
+  existed and is gone → `PAIR_PREPARATION_RECORD_LOST` before any new session, Task or
+  Dispatch.
+
+`mark_preparation_started()` mints no binding: a run with no launch record is refused
+rather than having one manufactured, so a successor can never create the authority it is
+supposed to be checked against.
+
+**One documented conservative case.** A process that died between the marker write and the
+first `CREATE_INTENDED` produced no external effect and is still refused, because this gate
+reads the marker rather than guessing at that two-write window. The remedy is the operator
+procedure below — never an unconditional relaunch.
+
+**The write ordering, exactly.** `_assert_preparation_not_lost()` runs before either role
+is prepared and, when no entry exists, writes the marker there — and refuses with
+`PAIR_PREPARATION_RECORD_CORRUPT` if that write fails. Only then does `_prepare_role()`
+write the first `CREATE_INTENDED`, and only then is a session created. So the order is
+always *marker → entry → session*, and "the marker is unset while an entry exists" is a
+state this writer cannot produce. (An earlier revision of this section described a crash
+"between the first entry write and the marker write" as a residual window; that ordering
+does not exist and the claim is withdrawn.)
+
+**The real remaining window, stated rather than hidden.** The marker's question is "was
+*any* entry ever written for this run", so it detects the loss of the **whole** document.
+It does not detect a document that is still present and still holds entries but has lost
+**some** of them: for a `(phase, gate_iteration, role)` whose entry is gone while another
+role's entry remains, `pause_policy.resolve_prepared_terminal(None, ...)` returns `create`
+without consulting the listing, and a new session is prepared under the same title as the
+predecessor's still-live one. This was reproduced directly (removing only the worker entry
+of an intact, admission-stage document; the re-entry created a second
+`<run_id>-pair-<phase>-1-worker` and the run completed). Two guards do apply and neither
+closes it: a lost launch record is refused (`PAIR_PREPARATION_BINDING_LOST`), and a
+**section**-level truncation of the same document is refused as
+`PAIR_PREPARATION_RECORD_CORRUPT` because a present document's top-level section set is
+exact. Entry-level granularity is not addressed by this change; treat a partially
+hand-edited or partially restored preparation document as unsafe and follow the operator
+procedure below rather than re-entering the run.
+
+### Residual prepared sessions: identification, state, ownership, procedure
+
+A prepared session can legitimately outlive the dispatch it was prepared for. This is not
+a leak and these sessions are **not** all ownerless orphans. No automatic termination is
+added by this change, and none should be inferred.
+
+**How a residual prepared session arises**
+
+| Cause | What exists afterwards |
+| --- | --- |
+| the pair's second create failed, or verification refused, after the first succeeded | one created, verified-or-not session with a `CREATED`/`CREATE_INTENDED`/`VERIFIED` entry |
+| a later named `BLOCKED` (model drift, record loss, unknown use, binding mismatch) | both sessions of the round, prepared and never delivered to |
+| a Reviewer prepared for pair admission whose turn never came (the Worker's gate failed, or the run stopped) | the Reviewer session, `VERIFIED`, with no use row |
+| a session superseded because the reuse gate refused it | the superseded session, with its `DELIVERED` use row intact |
+
+**How to identify one.** Every prepared session is titled
+`<run_id>-pair-<phase>-<gate_iteration>-<role>`, and its identity is the
+`terminal_digest` in its preparation entry — the title narrows, the digest decides. Read
+them from the run root:
+
+- `.pair_preparation.json` → `pairs` for `stage`, `create_attempt`, `terminal_title`,
+  `terminal_worktree`, `terminal_digest`, `requested_model`, `resolved_model_observed`,
+  `supersedes_digest`, `supersedes_reason`;
+- → `sessions` for whether that digest was ever delivered to, by which Dispatch, and what
+  earlier Dispatches used it (`previous_dispatch_ids`);
+- → `role_history` for the run's `(phase, role)` baseline;
+- `.pair_launch_binding.json` for the run's launch identity and `preparation_started_at`.
+
+**State and ownership.** A session with a `CREATED`/`VERIFIED` entry and no `sessions` row
+was created by this run's Coordinator and has never been dispatched to: it is **owned by
+the run** that prepared it, not ownerless. A session with a `DELIVERED` row is owned by the
+Dispatch named there and is subject to the ordinary OS-31/OS-48 lifecycle and finality
+rules. A session with a `CREATE_INTENDED` entry and no observed result has an **unknown**
+existence state — the create's outcome was never read — and is the one case where the
+record cannot say whether a session exists at all.
+
+**Allowed operator procedure.** Read-only first, and in this order:
+
+1. read the three documents above for the run;
+2. list the live sessions in the recorded `terminal_worktree` and match them by title, then
+   confirm by digest — a title match alone is not an identity, and the code never adopts a
+   title-only candidate;
+3. for each matched session, read its use row before touching it. A session with a
+   `DELIVERED` row may still be the subject of an open Dispatch;
+4. close only sessions you have positively identified by digest, that this run prepared,
+   that have no open Dispatch, and after checking `orca orchestration task-list --run` and
+   the open dispatches for the run. Closing is an operator decision, never an automatic
+   one;
+5. a session whose entry is `CREATE_INTENDED` with no observed result is **not** safe to
+   assume absent and **not** safe to assume present: enumerate it, record it, and decide
+   deliberately.
+
+Nothing in the engine closes, reuses, adopts or counts a residual session on its own.
+
+### Recovery support scope — what is wired and what is not
+
+Recovery of a model-aware run is supported **only** where the routing and the driver are
+explicitly injected into the reconstructing constructor. The distinction matters because
+the shipped resume/watchdog behaviour does not do that.
+
+**Supported.** `deterministic_workflow.launcher.build_orca_adapter_for_run(run_id, ...)`
+called with a non-empty `agent_profile_name` **and** a `model_driver`. It reconstructs the
+routing through the existing derivation from the run's own committed declaration — phases
+and risk from one read — reopens the launch binding and the preparation document, and the
+adapter then reconciles the full launch identity, cell by cell, before any effect
+(`PAIR_PREPARATION_BINDING_MISMATCH` / `PAIR_PREPARATION_BINDING_UNVERIFIABLE` otherwise).
+The OS-14 test suite's successor-process scenarios take exactly this door.
+
+**Not wired: the CLI call sites.** There are exactly two in-repository callers of
+`build_orca_adapter_for_run` outside the tests, and **neither passes
+`agent_profile_name` or `model_driver`**:
+
+- `launcher.run_pause_cli` — `scripts/deterministic_workflow/launcher.py:3631`, the
+  `pause`/`resume` CLI path;
+- `launcher._watchdog_wiring` — `scripts/deterministic_workflow/launcher.py:4257`, the
+  OS-43 watchdog and one-shot recovery path.
+
+Both pass only `run_id`, `artifact_base`, `runtime_state`, `run_owner`, `project_root`
+(and, in the watchdog's case, `harness_factory`). A process built that way holds no routing, so
+`harness.routing_binding()` reports `model_aware == "false"` against a binding that says
+`"true"`, and the adapter refuses `PAIR_PREPARATION_BINDING_UNVERIFIABLE` before any
+effect. **A model-aware run therefore cannot be resumed through the CLI today.** That is
+the fail-closed outcome, not a gap that silently degrades — and completing the CLI wiring
+is deliberately *not* part of this correction run.
+
+**Pre-feature runs.** A run launched before this feature has no launch binding at all and
+is refused `PAIR_PREPARATION_LAUNCH_RECORD_ABSENT`: an absence is not a verdict in either
+direction, and a successor may not manufacture the authority it is supposed to be checked
+against. A run launched under the v1 schemas is refused
+`PAIR_PREPARATION_RECORD_CORRUPT`.
+
+**Safe transition procedure for such a run — inspect before you relaunch.**
+
+1. Do **not** relaunch unconditionally. The refusal means this process cannot prove what
+   the old run did, not that the old run did nothing.
+2. Enumerate the run's external effects first: `orca orchestration task-list --run <run>`
+   for Tasks, the run's open dispatches, and the live sessions in the run's worktree
+   matched by the pair title and confirmed by digest.
+3. Settle or account for every open Dispatch found. A relaunch while a Dispatch is open
+   duplicates work and can leave two agents on one artifact path.
+4. Only once no open Dispatch and no unaccounted session remains, start a **new** run.
+   Preserve the old run's artifacts and records; do not edit or delete them.
+5. If step 2 cannot be completed — a listing that cannot be read, a `CREATE_INTENDED` entry
+   with no observed outcome — stop and escalate. An unreadable source is unknown, never
+   empty.

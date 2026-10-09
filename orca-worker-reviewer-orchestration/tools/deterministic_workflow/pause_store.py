@@ -1,7 +1,7 @@
 """Tier-2 durable pause index, coordination fence, projection and settlement journal.
 
-Two durable files live here, both over the :mod:`durable_store` discipline (flock on a
-sidecar + ``fsync`` + ``os.replace``), and neither imports LangGraph or Orca (OS-31 §10.1):
+Four durable files live here, all over the :mod:`durable_store` discipline (flock on a
+sidecar + ``fsync`` + ``os.replace``), and none imports LangGraph or Orca (OS-31 §10.1):
 
 ``.pause_state.json``          one record per **run** -- discovery identity, claim/lease
                                fence, checkpoint pointer, disposition, applied set and the
@@ -10,6 +10,14 @@ sidecar + ``fsync`` + ``os.replace``), and neither imports LangGraph or Orca (OS
                                effect it describes, so a fresh process can reconstruct the
                                dispatch set and terminal provenance a dead process held
                                only in memory.
+``.pair_launch_binding.json``  OS-14: ONE record per run -- WHICH KIND of launch opened it
+                               (its routing identity and model-selection driver class),
+                               written at run OPEN for **every** Orca-adapter run so an
+                               absent record can never be mistaken for a legacy one.
+``.pair_preparation.json``     OS-14: one entry per (phase, gate_iteration, role) -- WHAT
+                               was prepared for a Worker/Reviewer pair, with the creation
+                               INTENT written before the external effect and the created
+                               session's identity written only after observing it.
 
 The pause record is **never** the authority for execution state.  That is the OS-40
 checkpoint (PLAN D2/F-001); ``projection`` is subordinate and is documented as such so no
@@ -805,3 +813,897 @@ def store_for(run_id: str, *, artifact_base: str | os.PathLike[str],
 
 def iter_journal_stages() -> Iterator[str]:
     yield from JOURNAL_STAGES
+
+
+# ======================================================================================
+# OS-14 pair preparation: the two NEW durable documents
+# ======================================================================================
+# ---- the launch binding: WHICH KIND of launch opened this run ------------------------
+PAIR_BINDING_SCHEMA_VERSION = "os14.pair_launch_binding.v2"
+PAIR_BINDING_FILENAME = ".pair_launch_binding.json"
+PAIR_BINDING_KEYS = (
+    "run_id", "runtime", "profile_name", "profile_source",
+    "routing_schema_version",      # decimal string; "0" / "" means no profile document
+    "routing_digest",              # "" iff model_aware == "false"
+    "model_aware",                 # the STRING "true" or "false" -- never a bool
+    "driver_type_id",              # the driver CLASS's normalised import path, "" for none
+    # OS-14 BUGFIX (review B3).  The run's "a preparation entry has been written at least
+    # once" MARKER, set ONCE, monotonically, by the preparation path itself and never
+    # cleared.  It lives HERE rather than in the preparation document because its whole
+    # job is to survive that document: a marker stored inside the record whose loss it
+    # detects detects nothing.  Deliberately NOT part of the launch IDENTITY (below), so
+    # setting it can never make a run's own binding mismatch itself.
+    "preparation_started_at",
+    "recorded_by", "recorded_at",
+)
+PAIR_BINDING_MODEL_AWARE = ("true", "false")
+PAIR_BINDING_IDENTITY_KEYS = tuple(
+    key for key in PAIR_BINDING_KEYS
+    if key not in ("recorded_by", "recorded_at", "preparation_started_at"))
+#: The LAUNCH IDENTITY: exactly the cells ``harness.routing_binding()`` emits, which is
+#: exactly what ``OrcaAdapter._assert_preparation_binding`` compares on adoption.  Derived
+#: from PAIR_BINDING_KEYS rather than re-spelled, so a cell added to the record in a later
+#: schema version is COMPARED by construction instead of being silently ignored.
+PAIR_LAUNCH_IDENTITY_KEYS = tuple(
+    key for key in PAIR_BINDING_IDENTITY_KEYS if key != "run_id")
+
+# ---- the preparation entries: WHAT was prepared for which pair ----------------------
+PAIR_PREPARATION_SCHEMA_VERSION = "os14.pair_preparation.v3"
+PAIR_PREPARATION_FILENAME = ".pair_preparation.json"
+PAIR_PREPARATION_STAGES = ("CREATE_INTENDED", "CREATE_REFUSED", "CREATED", "VERIFIED")
+PAIR_PREPARATION_ROLES = ("worker", "reviewer")
+PAIR_ENTRY_KEYS = (
+    "run_id", "phase", "gate_iteration", "role",        # identity
+    "stage", "create_attempt",                          # progress (decimal strings)
+    "terminal_title", "terminal_worktree",              # INTENT -- before the effect
+    "terminal_digest",                                  # IDENTITY -- after observation
+    "requested_model",                                  # the routing's DECLARATION
+    "resolved_model_observed", "observed_at_run",       # prior-pass provenance
+    "refusal_command", "refusal_error_code", "refusal_receipt_digest",
+    # OS-14 BUGFIX (review B1).  PROVENANCE of a create attempt that exists because the
+    # PREVIOUS session of this same role was refused reuse: which session it replaced,
+    # and the gate's own refusal names.  Written in the same `record()` call that
+    # publishes the new `CREATE_INTENDED`, so a superseding attempt can never be mistaken
+    # for a first one.
+    "supersedes_digest", "supersedes_reason",
+    # OS-14 BUGFIX (review R1).  The USE-LEDGER CLAIM: every terminal digest this entry
+    # has recorded a row for in the `sessions` section, comma-joined and APPEND-ONLY.
+    # `record_session_use` publishes the claim and the row in ONE atomic document write,
+    # so a claim with no row cannot be produced by any interleaving of this module's
+    # writers -- which is what makes a row's later ABSENCE detectable at all.  Without
+    # it the `sessions` section is only self-consistent: a REMOVED row and a
+    # never-written row read identically, and `session_use()` answered the first with
+    # `None`, i.e. "this session was never delivered to".  Deliberately on the ENTRY
+    # rather than in a sibling section, so it cannot be lost INDEPENDENTLY of the entry
+    # whose session it is about.
+    "session_use_digests",
+    "recorded_by",
+    "create_intended_at", "create_settled_at", "verified_at",
+)
+#: Cleared when a NEW create attempt is published, so a retry's ``CREATE_INTENDED`` never
+#: carries the PREVIOUS ATTEMPT'S OWN result cells -- the digest of the session that
+#: attempt produced, that attempt's parsed refusal, that attempt's settle/verify stamps
+#: and that attempt's supersession provenance.  Mirrors the harness's own
+#: ``_MODEL_ROW_CLEARED`` discipline.
+#:
+#: OS-14 BUGFIX (review N3).  What it does NOT clear, and must not:
+#: ``resolved_model_observed`` / ``observed_at_run``.  Those are this RUN's MODEL HISTORY
+#: for the ``(phase, gate_iteration, role)`` slot, not one attempt's result, and the
+#: superseded comment claimed they were cleared when they never were.  Clearing them
+#: would turn a retry into a laundering step: refuse model-B on attempt 1, then retry and
+#: be accepted on attempt 2 because the only record that knew about model-A had just been
+#: erased.  The durable baseline a drift comparison reads lives in the ``role_history``
+#: section, which this set does not touch at all.
+#:
+#: SESSION USE is likewise untouched: it is filed per terminal DIGEST in the ``sessions``
+#: section, so a new create attempt cannot overwrite the past use state -- or the refusal
+#: grounds -- of the session it replaces.
+#:
+#: OS-14 BUGFIX (review R1).  ``session_use_digests`` is MONOTONE for the same reason and
+#: is likewise absent from this set: it is an append-only SET of the digests this entry
+#: has written a use row for, so a superseding create attempt ADDS its new session's
+#: digest and keeps the superseded one's.  Clearing it would delete the only proof that
+#: the replaced session's use row is required -- i.e. it would restore, through the retry
+#: path, exactly the "a missing row means unused" reading this cell exists to refuse.
+_PAIR_ENTRY_ATTEMPT_CLEARED = {
+    "terminal_digest": "", "refusal_command": "", "refusal_error_code": "",
+    "refusal_receipt_digest": "", "create_settled_at": "", "verified_at": "",
+    "supersedes_digest": "", "supersedes_reason": "",
+}
+
+# ---- OS-14 BUGFIX (review B1): the SESSION USE ledger --------------------------------
+#: Filed per terminal DIGEST, which is the only key that denotes one PHYSICAL session
+#: across processes, and APPEND-ONLY: this is the record that answers "has this session
+#: already been delivered to?", and an answer that can be overwritten by a later
+#: preparation pass answers nothing.
+#:
+#: Its own CLOSED stage set.  It touches, aliases and reinterprets neither
+#: :data:`PAIR_PREPARATION_STAGES` nor :data:`JOURNAL_STAGES`.
+PAIR_SESSION_USE_STAGES = ("DELIVERY_INTENDED", "DELIVERED")
+PAIR_SESSION_USE_KEYS = (
+    "run_id", "terminal_digest",                        # identity
+    "stage", "delivery_attempt",                        # progress (decimal string)
+    "phase", "gate_iteration", "role",                  # WHICH boundary used it
+    "intent_id", "dispatch_id",                         # WHICH dispatch used it
+    "previous_dispatch_ids",                            # every EARLIER use, comma-joined
+    "recorded_by", "intended_at", "settled_at",
+)
+
+# ---- OS-14 BUGFIX (review B2): the run-scoped ROLE MODEL HISTORY ---------------------
+#: One row per ``(phase, role)`` for the WHOLE run -- deliberately NOT per gate iteration,
+#: which is exactly the scope the in-memory ``_model_role_history`` had and the durable
+#: record did not.  WRITE-ONCE: the first positively verified resolved model of a
+#: ``(run, phase, role)`` is that slot's NON-DRIFT BASELINE, and a differing value is
+#: refused rather than recorded.
+#:
+#: HISTORY, never AUTHORITY.  Nothing reads this to decide that a session's model IS
+#: verified; it is read only to REFUSE a change.  Current verification authority is earned
+#: only by a positive re-verification through the live driver.
+PAIR_ROLE_HISTORY_KEYS = (
+    "run_id", "phase", "role", "resolved_model", "requested_model",
+    "first_gate_iteration", "recorded_by", "observed_at",
+)
+
+
+def terminal_use_digest(handle: str) -> str:
+    """The session-use ledger's key for a live handle.
+
+    ONE derivation, shared with the preparation entry's ``terminal_digest`` so a row
+    written for a handle and a row looked up for that handle cannot disagree.  A thin
+    re-export of :func:`pause_policy.terminal_digest`, kept here because this module owns
+    the document whose keys it spells and must not import the policy module at module
+    scope (``pause_policy`` already imports this one).
+    """
+    from . import pause_policy
+    return pause_policy.terminal_digest(handle)
+
+
+def _iso_now() -> str:
+    """The ONE ISO second-precision timestamp helper this module writes ``*_at`` cells with.
+
+    Same format as ``orca_adapter._now()`` and deliberately the same local-import shape.
+    NAMED DIFFERENTLY from :meth:`FilePauseRecordStore._now`, which is an INSTANCE method
+    returning the lease clock's FLOAT and is untouched: two different things may not share
+    one name in one module.
+    """
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class PairPreparationCorrupt(PauseStoreError):
+    """A pair launch record or preparation entry fails its own closed schema.
+
+    Never read as "nothing was prepared" and never as "a legacy run": an unreadable
+    authority is not an absent one.  :class:`PauseStoreError` is a ``ValueError`` subclass,
+    so catching it cannot swallow control flow.
+    """
+
+
+class PairSessionUseRecordLost(PairPreparationCorrupt):
+    """A session-USE row this document's OWN entries claim to have written is GONE.
+
+    OS-14 BUGFIX (review R1).  Its own CLASS, so this module's own contract tests can
+    assert the precise failure, while the adapter's CLOSED refusal-code set deliberately
+    gains no member: a subclass of :class:`PairPreparationCorrupt`, so every caller that
+    already fails closed on an unreadable preparation document fails closed on a lost row
+    too, unchanged, and reports it under the established, locked
+    ``PAIR_PREPARATION_RECORD_CORRUPT`` name -- exactly as review F-001's removed-section
+    refusal does, with WHICH record was lost named by the message below.
+    """
+
+
+def session_use_claims(entry: Mapping[str, Any] | None) -> tuple[str, ...]:
+    """The terminal digests this preparation entry has recorded a session-USE row for.
+
+    ONE parse of ``session_use_digests``, shared by the writer that appends to it and the
+    reader that checks it, so a claim written and a claim read cannot disagree.
+    """
+    raw = (entry or {}).get("session_use_digests") or ""
+    return tuple(part for part in raw.split(",") if part)
+
+
+def pair_binding_path(run_id: str, *,
+                      artifact_base: str | os.PathLike[str]) -> Path:
+    return run_root(artifact_base, run_id) / PAIR_BINDING_FILENAME
+
+
+def pair_preparation_path(run_id: str, *,
+                          artifact_base: str | os.PathLike[str]) -> Path:
+    return run_root(artifact_base, run_id) / PAIR_PREPARATION_FILENAME
+
+
+def validate_pair_binding(run_id: str, binding: Any) -> dict[str, Any]:
+    """Whole-or-nothing, byte-for-byte the discipline of :func:`validate_journal_row`."""
+    if not isinstance(binding, Mapping) or set(binding) != set(PAIR_BINDING_KEYS):
+        raise PairPreparationCorrupt(
+            "PAIR_BINDING_CORRUPT:closed fields: "
+            f"{sorted(binding) if isinstance(binding, Mapping) else type(binding).__name__}")
+    for key in PAIR_BINDING_KEYS:                       # EVERY value is a str
+        if not isinstance(binding[key], str):
+            raise PairPreparationCorrupt(f"PAIR_BINDING_CORRUPT:{key} type")
+    if not binding["run_id"] or binding["run_id"] != run_id:
+        raise PairPreparationCorrupt(
+            f"PAIR_BINDING_CORRUPT:identity {binding['run_id']!r} != {run_id!r}")
+    if binding["model_aware"] not in PAIR_BINDING_MODEL_AWARE:
+        raise PairPreparationCorrupt(
+            f"PAIR_BINDING_CORRUPT:model_aware {binding['model_aware']!r}")
+    if binding["model_aware"] == "true" and not binding["routing_digest"]:
+        raise PairPreparationCorrupt(
+            "PAIR_BINDING_CORRUPT:model-aware without a digest")
+    if binding["model_aware"] == "false" and (binding["routing_digest"]
+                                              or binding["driver_type_id"]):
+        raise PairPreparationCorrupt(
+            "PAIR_BINDING_CORRUPT:a legacy launch statement carries no routing digest "
+            "and no driver")
+    return dict(binding)
+
+
+def new_pair_binding(**fields: Any) -> dict[str, Any]:
+    binding: dict[str, Any] = {key: "" for key in PAIR_BINDING_KEYS}
+    binding["model_aware"] = "false"
+    binding.update(fields)
+    return validate_pair_binding(binding["run_id"], binding)
+
+
+def pair_key(phase: Any, gate_iteration: Any) -> str:
+    """``<phase>#<gate_iteration>`` -- ONE pair per gate round.  ``#`` is reserved."""
+    if "#" in str(phase):
+        raise PairPreparationCorrupt(
+            "PAIR_PREPARATION_CORRUPT:phase may not contain '#'")
+    return f"{phase}#{gate_iteration}"
+
+
+def validate_pair_entry(entry: Any) -> dict[str, Any]:
+    """Whole-or-nothing, the same discipline as :func:`validate_journal_row`."""
+    if not isinstance(entry, Mapping) or set(entry) != set(PAIR_ENTRY_KEYS):
+        raise PairPreparationCorrupt(
+            "PAIR_PREPARATION_CORRUPT:entry closed fields: "
+            f"{sorted(entry) if isinstance(entry, Mapping) else type(entry).__name__}")
+    for key in PAIR_ENTRY_KEYS:
+        if not isinstance(entry[key], str):
+            raise PairPreparationCorrupt(f"PAIR_PREPARATION_CORRUPT:{key} type")
+    if entry["stage"] not in PAIR_PREPARATION_STAGES:
+        raise PairPreparationCorrupt(
+            f"PAIR_PREPARATION_CORRUPT:unknown stage {entry['stage']!r}")
+    if entry["role"] not in PAIR_PREPARATION_ROLES:
+        raise PairPreparationCorrupt(
+            f"PAIR_PREPARATION_CORRUPT:unknown role {entry['role']!r}")
+    for key in ("run_id", "phase", "gate_iteration", "role"):
+        if not entry[key]:
+            raise PairPreparationCorrupt(f"PAIR_PREPARATION_CORRUPT:identity {key}")
+    if "#" in entry["phase"]:
+        raise PairPreparationCorrupt(
+            "PAIR_PREPARATION_CORRUPT:phase may not contain '#'")
+    for key in ("gate_iteration", "create_attempt"):
+        value = entry[key]
+        if not value.isdigit() or int(value) < 1:
+            raise PairPreparationCorrupt(
+                f"PAIR_PREPARATION_CORRUPT:{key} {value!r} is not a decimal >= 1")
+    # ---- OS-14 BUGFIX (review R1): the use-ledger claim is a comma-joined SET --------
+    # An empty or a repeated segment would make a claim ambiguous, and an ambiguous claim
+    # is as good as an absent one -- which is the single thing this cell exists to make
+    # impossible.  Same whole-or-nothing discipline as every other cell above.
+    claimed = entry["session_use_digests"]
+    if claimed:
+        parts = claimed.split(",")
+        if any(not part for part in parts) or len(set(parts)) != len(parts):
+            raise PairPreparationCorrupt(
+                f"PAIR_PREPARATION_CORRUPT:session_use_digests {claimed!r} is not a "
+                "comma-joined set of non-empty digests")
+    return dict(entry)
+
+
+def new_pair_entry(**fields: Any) -> dict[str, Any]:
+    entry: dict[str, Any] = {key: "" for key in PAIR_ENTRY_KEYS}
+    entry["stage"] = "CREATE_INTENDED"
+    entry["create_attempt"] = "1"
+    entry.update(fields)
+    return validate_pair_entry(entry)
+
+
+def role_history_key(phase: Any, role: str) -> str:
+    """``<phase>#<role>`` -- ONE baseline per (run, phase, role).  ``#`` is reserved."""
+    if "#" in str(phase):
+        raise PairPreparationCorrupt(
+            "PAIR_PREPARATION_CORRUPT:phase may not contain '#'")
+    return f"{phase}#{role}"
+
+
+def validate_pair_session_use(row: Any) -> dict[str, Any]:
+    """Whole-or-nothing, the same discipline as :func:`validate_pair_entry`."""
+    if not isinstance(row, Mapping) or set(row) != set(PAIR_SESSION_USE_KEYS):
+        raise PairPreparationCorrupt(
+            "PAIR_SESSION_USE_CORRUPT:closed fields: "
+            f"{sorted(row) if isinstance(row, Mapping) else type(row).__name__}")
+    for key in PAIR_SESSION_USE_KEYS:
+        if not isinstance(row[key], str):
+            raise PairPreparationCorrupt(f"PAIR_SESSION_USE_CORRUPT:{key} type")
+    if row["stage"] not in PAIR_SESSION_USE_STAGES:
+        raise PairPreparationCorrupt(
+            f"PAIR_SESSION_USE_CORRUPT:unknown stage {row['stage']!r}")
+    if row["role"] not in PAIR_PREPARATION_ROLES:
+        raise PairPreparationCorrupt(
+            f"PAIR_SESSION_USE_CORRUPT:unknown role {row['role']!r}")
+    for key in ("run_id", "terminal_digest", "phase", "gate_iteration", "intent_id"):
+        if not row[key]:
+            raise PairPreparationCorrupt(f"PAIR_SESSION_USE_CORRUPT:identity {key}")
+    for key in ("gate_iteration", "delivery_attempt"):
+        value = row[key]
+        if not value.isdigit() or int(value) < 1:
+            raise PairPreparationCorrupt(
+                f"PAIR_SESSION_USE_CORRUPT:{key} {value!r} is not a decimal >= 1")
+    if row["stage"] == "DELIVERED" and not row["dispatch_id"]:
+        raise PairPreparationCorrupt(
+            "PAIR_SESSION_USE_CORRUPT:a DELIVERED use names the Dispatch that used it; "
+            "a use whose owner is unrecorded stays at DELIVERY_INTENDED, which reads as "
+            "USED WITH AN UNKNOWN OUTCOME and never as unused")
+    return dict(row)
+
+
+def new_pair_session_use(**fields: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {key: "" for key in PAIR_SESSION_USE_KEYS}
+    row["stage"] = "DELIVERY_INTENDED"
+    row["delivery_attempt"] = "1"
+    row.update(fields)
+    return validate_pair_session_use(row)
+
+
+def validate_pair_role_history(row: Any) -> dict[str, Any]:
+    """Whole-or-nothing, the same discipline as :func:`validate_pair_entry`."""
+    if not isinstance(row, Mapping) or set(row) != set(PAIR_ROLE_HISTORY_KEYS):
+        raise PairPreparationCorrupt(
+            "PAIR_ROLE_HISTORY_CORRUPT:closed fields: "
+            f"{sorted(row) if isinstance(row, Mapping) else type(row).__name__}")
+    for key in PAIR_ROLE_HISTORY_KEYS:
+        if not isinstance(row[key], str):
+            raise PairPreparationCorrupt(f"PAIR_ROLE_HISTORY_CORRUPT:{key} type")
+    if row["role"] not in PAIR_PREPARATION_ROLES:
+        raise PairPreparationCorrupt(
+            f"PAIR_ROLE_HISTORY_CORRUPT:unknown role {row['role']!r}")
+    for key in ("run_id", "phase", "role", "resolved_model"):
+        if not row[key]:
+            raise PairPreparationCorrupt(f"PAIR_ROLE_HISTORY_CORRUPT:identity {key}")
+    if "#" in row["phase"]:
+        raise PairPreparationCorrupt(
+            "PAIR_ROLE_HISTORY_CORRUPT:phase may not contain '#'")
+    value = row["first_gate_iteration"]
+    if not value.isdigit() or int(value) < 1:
+        raise PairPreparationCorrupt(
+            f"PAIR_ROLE_HISTORY_CORRUPT:first_gate_iteration {value!r}")
+    return dict(row)
+
+
+def new_pair_role_history(**fields: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {key: "" for key in PAIR_ROLE_HISTORY_KEYS}
+    row["first_gate_iteration"] = "1"
+    row.update(fields)
+    return validate_pair_role_history(row)
+
+
+class FilePairBindingStore:
+    """The run's LAUNCH RECORD.  Written ONCE, at run OPEN, by the launcher.
+
+    An adoption NEVER writes one -- a successor may not manufacture the authority it is
+    supposed to be checked against.
+    """
+
+    def __init__(self, path: str | os.PathLike[str], *, run_id: str,
+                 owner_id: str | None = None, clock: Any | None = None,
+                 lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS) -> None:
+        try:
+            self._section = FileCriticalSection(path, clock=clock,
+                                                lock_timeout_seconds=lock_timeout_seconds)
+        except LockUnavailable as exc:  # pragma: no cover - non-POSIX hosts only
+            raise PauseStoreLockUnavailable(str(exc)) from exc
+        self.path = Path(path)
+        self.run_id = run_id
+        self.owner_id = owner_id or default_owner_id()
+
+    def _read(self) -> dict[str, Any] | None:
+        document = read_json_document(self.path,
+                                      schema_version=PAIR_BINDING_SCHEMA_VERSION,
+                                      corrupt_exc=PairPreparationCorrupt)
+        if not document:
+            return None                        # ABSENT -- and absence is no verdict
+        if set(document) - {"schema_version", "binding"}:
+            raise PairPreparationCorrupt("PAIR_BINDING_CORRUPT:top-level keys")
+        return validate_pair_binding(self.run_id, document.get("binding"))
+
+    def binding(self) -> dict[str, Any] | None:
+        with self._section.locked():
+            found = self._read()
+            return deepcopy(found) if found is not None else None
+
+    def record_binding(self, **fields: Any) -> dict[str, Any]:
+        """Create-once.  Identical identity cells re-record as a no-op; a DIFFERING one
+        raises, exactly as ``launcher.check_standalone_authority`` refuses to silently
+        re-bind a standalone launch.
+        """
+        candidate = new_pair_binding(run_id=self.run_id, recorded_by=self.owner_id,
+                                     recorded_at=_iso_now(), **fields)
+        with self._section.locked():
+            existing = self._read()
+            if existing is not None:
+                if any(existing[key] != candidate[key]
+                       for key in PAIR_BINDING_IDENTITY_KEYS):
+                    raise PairPreparationCorrupt(
+                        "PAIR_BINDING_CONFLICT:this run is already bound to a different "
+                        "launch record; a run is not re-bound to a different kind of "
+                        "launch, or a different routing, under its own name")
+                return deepcopy(existing)      # the FIRST record's provenance stands
+            write_json_document(self.path, {
+                "schema_version": PAIR_BINDING_SCHEMA_VERSION, "binding": candidate})
+            return deepcopy(candidate)
+
+    def preparation_started(self) -> str:
+        """The run's "a preparation entry has been written at least once" marker, or ``""``.
+
+        OS-14 BUGFIX (review B3).  ``""`` means NO entry was ever written for this run,
+        and because a ``CREATE_INTENDED`` entry is written strictly BEFORE every
+        ``terminal create``, that is a POSITIVE statement that preparation produced no
+        external effect.  A non-empty value together with an EMPTY preparation document is
+        therefore the one state that proves the document was LOST -- which is exactly the
+        statement the preparation document itself cannot make about its own absence.
+        """
+        with self._section.locked():
+            found = self._read()
+            return "" if found is None else found["preparation_started_at"]
+
+    def mark_preparation_started(self) -> str:
+        """Set the marker ONCE; return the value that stands.  Monotonic and one-way.
+
+        Mints NO binding: a run with no launch record is refused here rather than having
+        one manufactured for it, so this method cannot create the authority it is supposed
+        to be checked against.  It can only ever make the B3 gate MORE strict -- there is
+        no path that clears it.
+        """
+        with self._section.locked():
+            found = self._read()
+            if found is None:
+                raise PairPreparationCorrupt(
+                    "PAIR_BINDING_ABSENT:a preparation marker is an annotation on an "
+                    "EXISTING launch record, never a way to create one")
+            if found["preparation_started_at"]:
+                return found["preparation_started_at"]       # the FIRST statement stands
+            found["preparation_started_at"] = _iso_now()
+            validate_pair_binding(self.run_id, found)
+            write_json_document(self.path, {
+                "schema_version": PAIR_BINDING_SCHEMA_VERSION, "binding": found})
+            return found["preparation_started_at"]
+
+
+class FilePairPreparationStore:
+    """One row per ``(phase, gate_iteration, role)``.
+
+    NOT the settlement journal: it is deliberately absent from
+    ``OrcaAdapter.capabilities()`` and changes no journal stage.
+    ``PAIR_PREPARATION_STAGES`` is this document's OWN closed set and does not touch,
+    alias or reinterpret :data:`JOURNAL_STAGES`.
+    """
+
+    def __init__(self, path: str | os.PathLike[str], *, run_id: str,
+                 owner_id: str | None = None, clock: Any | None = None,
+                 lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS) -> None:
+        try:
+            self._section = FileCriticalSection(path, clock=clock,
+                                                lock_timeout_seconds=lock_timeout_seconds)
+        except LockUnavailable as exc:  # pragma: no cover - non-POSIX hosts only
+            raise PauseStoreLockUnavailable(str(exc)) from exc
+        self.path = Path(path)
+        self.run_id = run_id
+        self.owner_id = owner_id or default_owner_id()
+
+    #: The document's three CLOSED sections.  ``pairs`` is the per-(phase, gate_iteration,
+    #: role) preparation entry; ``sessions`` is the APPEND-ONLY per-digest session USE
+    #: ledger (review B1); ``role_history`` is the WRITE-ONCE per-(phase, role) non-drift
+    #: baseline (review B2).  An unknown top-level key is corruption, as before -- and so,
+    #: since review F-001, is a MISSING one: the set below is EXACT, not a superset of
+    #: whatever a present document happens to carry.
+    _SECTIONS = ("pairs", "sessions", "role_history")
+
+    def _read(self) -> dict[str, Any]:
+        """The ``pairs`` section.  Kept as the name every existing caller reads."""
+        return self._read_document()["pairs"]
+
+    def _read_document(self) -> dict[str, dict[str, Any]]:
+        document = read_json_document(self.path,
+                                      schema_version=PAIR_PREPARATION_SCHEMA_VERSION,
+                                      corrupt_exc=PairPreparationCorrupt)
+        if not document:
+            # ABSENT FILE -- the ONE state in which no section can be missing, because
+            # there is no document for it to be missing from.  `read_json_document`
+            # returns ``{}`` for ``FileNotFoundError`` ALONE: an unreadable, malformed or
+            # version-incompatible file RAISES there, so this branch cannot be reached by
+            # a document that exists.  Whether this absence is a GENUINE first write or a
+            # LOST document is not decided here and never can be -- that is the launch
+            # record's B3 marker's job (`OrcaAdapter._assert_preparation_not_lost`).
+            return {section: {} for section in self._SECTIONS}
+        if set(document) - {"schema_version", *self._SECTIONS}:
+            raise PairPreparationCorrupt("PAIR_PREPARATION_CORRUPT:top-level keys")
+        # ---- OS-14 BUGFIX (review F-001): a PRESENT document's section set is EXACT ----
+        # `_write()` is this document's ONLY writer and emits all three sections on every
+        # write, so a present document that lacks one was TRUNCATED after the fact.  Read
+        # with `document.get(section, {})` that truncation became positive EMPTY state --
+        # "this session was never delivered to" (`sessions`) and "this role has no
+        # baseline, so the first observation may establish one" (`role_history`) -- which
+        # are exactly the two statements review B1 and B2 require a MISSING record never
+        # to make.  So the absence is refused BY NAME, before any section is interpreted
+        # and therefore before any session creation, Task creation or delivery.
+        missing = [section for section in self._SECTIONS if section not in document]
+        if missing:
+            raise PairPreparationCorrupt(
+                "PAIR_PREPARATION_RECORD_CORRUPT:this run's preparation document exists "
+                f"and is missing the required section(s) {', '.join(missing)}.  Every "
+                "write of this document emits all of "
+                f"{', '.join(self._SECTIONS)}, so a section that is gone was REMOVED -- "
+                "and a removed use/history record is unknown, never 'unused' and never "
+                "'no baseline yet'")
+        sections: dict[str, dict[str, Any]] = {}
+        for section in self._SECTIONS:
+            found = document[section]
+            if not isinstance(found, dict):
+                raise PairPreparationCorrupt(
+                    f"PAIR_PREPARATION_CORRUPT:{section} container")
+            sections[section] = found
+        for key, slot in sections["pairs"].items():
+            if not isinstance(slot, dict):
+                raise PairPreparationCorrupt("PAIR_PREPARATION_CORRUPT:pair container")
+            for role, entry in slot.items():
+                validated = validate_pair_entry(entry)
+                # Row identity, exactly as the journal checks it: the cells must agree
+                # with the key they are filed under.
+                if (role != validated["role"]
+                        or pair_key(validated["phase"],
+                                    validated["gate_iteration"]) != key):
+                    raise PairPreparationCorrupt(
+                        "PAIR_PREPARATION_CORRUPT:entry identity")
+        for digest, row in sections["sessions"].items():
+            if validate_pair_session_use(row)["terminal_digest"] != digest:
+                raise PairPreparationCorrupt("PAIR_SESSION_USE_CORRUPT:row identity")
+        # ---- OS-14 BUGFIX (review R1): the use ledger's ROWS are COMPLETE -------------
+        # Review F-001 made the SECTION SET exact.  That is not enough, and the Final
+        # Reviewer proved it: with all three sections present, removing ONE required
+        # per-digest row still made `session_use()` answer `None` for an already-delivered
+        # session, so the validation repair re-delivered to it without the reuse gate ever
+        # being asked.  A section's presence says nothing about its rows.
+        #
+        # `record_session_use` appends the digest to its OWN pair entry in the SAME
+        # `write_json_document` call that writes the row, so "a claim exists and its row
+        # does not" is unreachable for every interleaving of this module's writers --
+        # there is one write, not two, so not even a crash between them exists.  A claimed
+        # row that is gone was therefore REMOVED after the fact, and that is refused BY
+        # NAME here: before any section is interpreted, and so before any session
+        # creation, Task creation, reuse-gate call or delivery.
+        #
+        # What this deliberately does NOT do is turn a genuinely prepared-but-undispatched
+        # session into a refusal: such a session has no row because nothing ever recorded
+        # one, so no entry claims it, so there is nothing missing.  "No row" still means
+        # UNUSED -- but now only when the document itself states that no row was written.
+        for key, slot in sections["pairs"].items():
+            for role, entry in slot.items():
+                for digest in session_use_claims(entry):
+                    if digest not in sections["sessions"]:
+                        raise PairSessionUseRecordLost(
+                            f"PAIR_SESSION_USE_RECORD_LOST:preparation entry {key}/{role} "
+                            f"records that a session-use row was written for digest "
+                            f"{digest} and this document's 'sessions' ledger holds no row "
+                            "for it, so the row has been LOST.  A missing use row is "
+                            "UNKNOWN use, never unused: this run may already have "
+                            "delivered to that session, and nothing here can prove it "
+                            "did not")
+        for key, row in sections["role_history"].items():
+            validated = validate_pair_role_history(row)
+            if role_history_key(validated["phase"], validated["role"]) != key:
+                raise PairPreparationCorrupt("PAIR_ROLE_HISTORY_CORRUPT:row identity")
+        return sections
+
+    def _write(self, pairs: dict[str, Any], sections: dict[str, Any] | None = None) -> None:
+        for slot in pairs.values():
+            for entry in slot.values():
+                validate_pair_entry(entry)
+        document = dict(sections or self._read_document())
+        document["pairs"] = pairs
+        for digest, row in document["sessions"].items():
+            validate_pair_session_use(row)
+        for key, row in document["role_history"].items():
+            validate_pair_role_history(row)
+        write_json_document(self.path, {
+            "schema_version": PAIR_PREPARATION_SCHEMA_VERSION,
+            **{section: document[section] for section in self._SECTIONS}})
+
+    def pairs(self) -> dict[str, dict[str, dict[str, Any]]]:
+        with self._section.locked():
+            return deepcopy(self._read())
+
+    def entry(self, phase: Any, gate_iteration: Any,
+              role: str) -> dict[str, Any] | None:
+        key = pair_key(phase, gate_iteration)
+        with self._section.locked():
+            found = self._read().get(key, {}).get(role)
+            return deepcopy(found) if found is not None else None
+
+    def has_any(self) -> bool:
+        """"Any entry at all exists".
+
+        Used for EXACTLY ONE purpose: separating a LOST launch record from an ABSENT one.
+        It may never decide that a run is legacy -- only a positive
+        ``binding()["model_aware"] == "false"`` may do that.
+        """
+        with self._section.locked():
+            return any(slot for slot in self._read().values())
+
+    def record(self, phase: Any, gate_iteration: Any, role: str, *,
+               stage: str, **fields: Any) -> dict[str, Any]:
+        """Write or promote one whole entry.
+
+        Promotion is monotonic on ``(create_attempt, PAIR_PREPARATION_STAGES.index(stage))``.
+        Re-recording ``VERIFIED`` on a later pass is rank-equal, hence permitted, and
+        refreshes ``resolved_model_observed`` / ``verified_at``.
+        """
+        if stage not in PAIR_PREPARATION_STAGES:
+            raise PairPreparationCorrupt(
+                f"PAIR_PREPARATION_CORRUPT:unknown stage {stage!r}")
+        key = pair_key(phase, gate_iteration)
+        with self._section.locked():
+            sections = self._read_document()
+            pairs = sections["pairs"]
+            slot = pairs.setdefault(key, {})
+            existing = slot.get(role)
+            if existing is None:
+                entry = new_pair_entry(run_id=self.run_id, phase=str(phase),
+                                       gate_iteration=str(gate_iteration), role=role,
+                                       stage=stage, recorded_by=self.owner_id, **fields)
+            else:
+                old_attempt = int(existing["create_attempt"])
+                new_attempt = int(fields.get("create_attempt",
+                                             existing["create_attempt"]))
+                old_rank = (old_attempt,
+                            PAIR_PREPARATION_STAGES.index(existing["stage"]))
+                new_rank = (new_attempt, PAIR_PREPARATION_STAGES.index(stage))
+                if new_rank < old_rank:
+                    raise PairPreparationCorrupt(
+                        "PAIR_PREPARATION_CORRUPT:non-monotonic promotion "
+                        f"{old_rank} -> {new_rank}")
+                if new_attempt == old_attempt and existing["stage"] == "CREATE_REFUSED":
+                    raise PairPreparationCorrupt(
+                        "PAIR_PREPARATION_CORRUPT:CREATE_REFUSED and CREATED are "
+                        "ALTERNATIVE successors of one CREATE_INTENDED and are never "
+                        "promoted into each other; a retry carries create_attempt + 1")
+                if new_attempt > old_attempt and stage != "CREATE_INTENDED":
+                    raise PairPreparationCorrupt(
+                        "PAIR_PREPARATION_CORRUPT:a new create attempt is published as "
+                        "CREATE_INTENDED before its effect, never after it")
+                entry = dict(existing)
+                if new_attempt > old_attempt:
+                    entry.update(_PAIR_ENTRY_ATTEMPT_CLEARED)
+                entry.update(fields)
+                entry["create_attempt"] = str(new_attempt)
+                entry["stage"] = stage
+                entry["recorded_by"] = self.owner_id
+                entry = validate_pair_entry(entry)
+            slot[role] = entry
+            self._write(pairs, sections)
+            return deepcopy(entry)
+
+
+    # ---- OS-14 BUGFIX (review B1): the SESSION USE ledger ---------------------------
+    def session_use(self, terminal_digest: str) -> dict[str, Any] | None:
+        """What this run has recorded about DELIVERING to this physical session.
+
+        ``None`` means this document holds NO use row for the session.  In a document at
+        :data:`PAIR_PREPARATION_SCHEMA_VERSION` that is a POSITIVE statement that the
+        session was never delivered to, and it rests on TWO invariants, not one:
+
+        * the writer below records ``DELIVERY_INTENDED`` strictly BEFORE the delivery, so
+          a delivery that happened has a row; and
+        * OS-14 BUGFIX (review R1) -- every row the writer creates is CLAIMED, in the same
+          atomic write, by the pair entry it was written for, and ``_read_document``
+          refuses the whole document when a claimed row is gone.  So an absent row is
+          absent BY THE DOCUMENT'S OWN STATEMENT, not merely absent from a section whose
+          rows nothing counts.  A removed row no longer reaches this method at all.
+
+        It is NOT a statement any OLDER document can make -- which is exactly why the
+        schema version moved again: an earlier document is refused as corrupt rather than
+        read as "unused".
+        """
+        with self._section.locked():
+            found = self._read_document()["sessions"].get(terminal_digest)
+            return deepcopy(found) if found is not None else None
+
+    def sessions(self) -> dict[str, dict[str, Any]]:
+        with self._section.locked():
+            return deepcopy(self._read_document()["sessions"])
+
+    def record_session_use(self, terminal_digest: str, *, stage: str, phase: Any,
+                           gate_iteration: Any, role: str, intent_id: str,
+                           dispatch_id: str = "",
+                           delivery_attempt: Any | None = None) -> dict[str, Any]:
+        """Record one session USE.  APPEND-ONLY in every direction that matters.
+
+        Within one ``delivery_attempt`` the stage is monotonic
+        (``DELIVERY_INTENDED`` -> ``DELIVERED``) and never goes back.  A LATER delivery of
+        the same session carries ``delivery_attempt + 1`` and re-enters
+        ``DELIVERY_INTENDED``, and the dispatch id of every earlier use is APPENDED to
+        ``previous_dispatch_ids`` rather than overwritten -- so a reused session's past
+        is still readable, which is what "never overwrites past use state" means as code.
+        """
+        if stage not in PAIR_SESSION_USE_STAGES:
+            raise PairPreparationCorrupt(
+                f"PAIR_SESSION_USE_CORRUPT:unknown stage {stage!r}")
+        if not terminal_digest:
+            raise PairPreparationCorrupt("PAIR_SESSION_USE_CORRUPT:identity digest")
+        with self._section.locked():
+            sections = self._read_document()
+            rows = sections["sessions"]
+            existing = rows.get(terminal_digest)
+            common = {"phase": str(phase), "gate_iteration": str(gate_iteration),
+                      "role": role, "intent_id": intent_id,
+                      "recorded_by": self.owner_id}
+            if existing is None:
+                row = new_pair_session_use(
+                    run_id=self.run_id, terminal_digest=terminal_digest, stage=stage,
+                    delivery_attempt=str(1 if delivery_attempt is None
+                                         else delivery_attempt),
+                    dispatch_id=dispatch_id, intended_at=_iso_now(),
+                    settled_at=_iso_now() if stage == "DELIVERED" else "", **common)
+            else:
+                old_attempt = int(existing["delivery_attempt"])
+                new_attempt = int(old_attempt if delivery_attempt is None
+                                  else delivery_attempt)
+                old_rank = (old_attempt,
+                            PAIR_SESSION_USE_STAGES.index(existing["stage"]))
+                new_rank = (new_attempt, PAIR_SESSION_USE_STAGES.index(stage))
+                if new_rank <= old_rank:
+                    raise PairPreparationCorrupt(
+                        "PAIR_SESSION_USE_CORRUPT:non-monotonic use "
+                        f"{old_rank} -> {new_rank}; a session's recorded use is "
+                        "append-only and is never rewound or re-stated")
+                row = dict(existing)
+                if new_attempt > old_attempt:
+                    if stage != "DELIVERY_INTENDED":
+                        raise PairPreparationCorrupt(
+                            "PAIR_SESSION_USE_CORRUPT:a new delivery attempt is "
+                            "published as DELIVERY_INTENDED before its effect")
+                    earlier = [part for part in
+                               (row["previous_dispatch_ids"], row["dispatch_id"])
+                               if part]
+                    row["previous_dispatch_ids"] = ",".join(earlier)
+                    row["dispatch_id"] = ""
+                    row["settled_at"] = ""
+                    row["intended_at"] = _iso_now()
+                row.update(common)
+                row["delivery_attempt"] = str(new_attempt)
+                row["stage"] = stage
+                if dispatch_id:
+                    row["dispatch_id"] = dispatch_id
+                if stage == "DELIVERED":
+                    row["settled_at"] = _iso_now()
+                row = validate_pair_session_use(row)
+            # ---- OS-14 BUGFIX (review R1): the ENTRY's CLAIM, in the SAME write ------
+            # The row and the claim that proves the row exists are published by ONE
+            # `write_json_document` call, so there is no window in which one is durable
+            # and the other is not, and no write ordering to get wrong.
+            #
+            # The entry is REQUIRED, not optional.  In production a use is only ever
+            # recorded for a session THIS run prepared: `OrcaAdapter.start` reaches
+            # `_record_delivery_intent` with a handle only when `_prepare_pair` has
+            # already written the entry for the same (phase, gate_iteration, role), and
+            # the settled half re-uses that same identity.  A row whose entry could not
+            # claim it would be a row whose later loss is undetectable -- which is the
+            # defect, not a tolerated edge.
+            slot_key = pair_key(phase, gate_iteration)
+            entry = sections["pairs"].get(slot_key, {}).get(role)
+            if entry is None:
+                raise PairPreparationCorrupt(
+                    f"PAIR_SESSION_USE_CORRUPT:no preparation entry {slot_key}/{role} to "
+                    "record this session use against; a session use is recorded only for "
+                    "a session this run prepared, and only the entry can hold the claim "
+                    "that makes the row's absence detectable")
+            claimed = session_use_claims(entry)
+            if terminal_digest not in claimed:
+                sections["pairs"][slot_key][role] = validate_pair_entry(
+                    {**entry,
+                     "session_use_digests": ",".join((*claimed, terminal_digest))})
+            rows[terminal_digest] = row
+            self._write(sections["pairs"], sections)
+            return deepcopy(row)
+
+    # ---- OS-14 BUGFIX (review B2): the run-scoped ROLE MODEL HISTORY ----------------
+    def role_history(self, phase: Any, role: str) -> dict[str, Any] | None:
+        """This run's NON-DRIFT BASELINE for ``(phase, role)``, or ``None``.
+
+        Run-scoped by construction: the document lives under this run's own root and
+        every row carries this run's id, so a genuinely new run starts with no baseline
+        and may resolve a role to a different model.  ``None`` is "no baseline yet", which
+        is the only state in which a first observation may establish one.
+        """
+        with self._section.locked():
+            found = self._read_document()["role_history"].get(
+                role_history_key(phase, role))
+            return deepcopy(found) if found is not None else None
+
+    def role_histories(self) -> dict[str, dict[str, Any]]:
+        with self._section.locked():
+            return deepcopy(self._read_document()["role_history"])
+
+    # ---- OS-14 BUGFIX (review R2): the baseline ROW's presence is checkable -----------
+    def role_observations(self, phase: Any, role: str) -> dict[str, str]:
+        """EVERY durable accepted observation of ``(run, phase, role)``, by gate iteration.
+
+        :meth:`role_history` is the run-scoped baseline ROW; an entry's
+        ``resolved_model_observed`` is ONE gate iteration's accepted observation.  This is
+        the set of ALL of the latter for a ``(phase, role)``, across every gate iteration
+        the document holds -- and it is what makes the baseline row's own PRESENCE
+        checkable instead of merely its value.
+
+        Review F-001 made the ``role_history`` SECTION's presence exact; the Final
+        Reviewer proved that is not enough.  At an iteration boundary the CURRENT entry is
+        legitimately absent, so with the one required row removed both of
+        ``_durable_model_baseline``'s legs read empty even though iteration 1's own
+        ``VERIFIED`` entry still proves, on the same disk, that a baseline was
+        established.  An earlier entry's observation is exactly as durable as the row --
+        the writer writes the row FIRST -- so an observation standing with no row behind
+        it is a MISSING REQUIRED RECORD, never "no baseline yet".
+
+        Run-scoped by construction, like every other section: this document lives under
+        this run's own root, so a genuinely NEW run reads an empty mapping here and may
+        resolve the role to a different model.
+        """
+        with self._section.locked():
+            found: dict[str, str] = {}
+            for slot in self._read_document()["pairs"].values():
+                entry = slot.get(role)
+                if entry is None or entry["phase"] != str(phase):
+                    continue
+                if entry["resolved_model_observed"]:
+                    found[entry["gate_iteration"]] = entry["resolved_model_observed"]
+            return found
+
+    def record_role_history(self, phase: Any, role: str, resolved_model: str, *,
+                            requested_model: str = "",
+                            gate_iteration: Any = 1) -> dict[str, Any]:
+        """Establish, or re-confirm, this ``(run, phase, role)`` baseline.  WRITE-ONCE.
+
+        An EQUAL value re-records as a no-op, which is what every later accepted
+        verification of the same role is.  A DIFFERING value is REFUSED here rather than
+        recorded: this store does not hold both, and a baseline that could be replaced by
+        the value it is supposed to refuse would be no baseline at all.  The caller
+        compares first and never reaches this with a drifted value; the refusal is the
+        second lock on the same invariant.
+        """
+        key = role_history_key(phase, role)
+        with self._section.locked():
+            sections = self._read_document()
+            rows = sections["role_history"]
+            existing = rows.get(key)
+            if existing is not None:
+                if existing["resolved_model"] != resolved_model:
+                    raise PairPreparationCorrupt(
+                        f"PAIR_ROLE_HISTORY_CONFLICT:{key} is already bound to "
+                        f"{existing['resolved_model']!r} in this run and this process "
+                        f"resolved {resolved_model!r}; a role's resolved model is a NEW "
+                        "RUN's business, never an overwrite under this run's own name")
+                return deepcopy(existing)        # the FIRST baseline's provenance stands
+            row = new_pair_role_history(
+                run_id=self.run_id, phase=str(phase), role=role,
+                resolved_model=resolved_model, requested_model=requested_model,
+                first_gate_iteration=str(gate_iteration), recorded_by=self.owner_id,
+                observed_at=_iso_now())
+            rows[key] = row
+            self._write(sections["pairs"], sections)
+            return deepcopy(row)
+
+
+def pair_binding_for(run_id: str, *, artifact_base: str | os.PathLike[str],
+                     clock: Any | None = None,
+                     owner_id: str | None = None) -> FilePairBindingStore:
+    return FilePairBindingStore(pair_binding_path(run_id, artifact_base=artifact_base),
+                                run_id=run_id, clock=clock, owner_id=owner_id)
+
+
+def pair_preparation_for(run_id: str, *, artifact_base: str | os.PathLike[str],
+                         clock: Any | None = None,
+                         owner_id: str | None = None) -> FilePairPreparationStore:
+    return FilePairPreparationStore(
+        pair_preparation_path(run_id, artifact_base=artifact_base),
+        run_id=run_id, clock=clock, owner_id=owner_id)

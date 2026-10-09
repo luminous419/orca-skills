@@ -44,6 +44,7 @@ one parser means two profile formats cannot disagree about what a document says.
 
 from __future__ import annotations
 
+import importlib
 import re
 import shutil
 from dataclasses import dataclass
@@ -1360,6 +1361,128 @@ def model_selection_capabilities(driver: Any) -> frozenset[str]:
     if callable(getattr(driver, "select_and_verify", None)):
         return frozenset({MODEL_SELECTION_VERIFIED_CAPABILITY})
     return frozenset()
+
+
+#: The ONE normalisation that makes a class's import path identical in the two layouts
+#: this tree actually ships: the repository layout
+#: (`scripts.deterministic_workflow.fake_adapter`, `scripts.orca_runtime_harness`) and
+#: the installed FLAT Skill layout (`deterministic_workflow.fake_adapter`,
+#: `orca_runtime_harness`) -- the same two layouts every
+#: `try: from scripts import X / except ImportError: import X` pair in this tree spans,
+#: and the same pair `validate_skills.py` byte-mirrors. EXACTLY ONE leading "scripts."
+#: component is stripped, and `resolve_driver_type` tries BOTH spellings -- so the SAME
+#: class in the two layouts binds EQUAL, while a genuine third-party package that really
+#: is named `scripts.*` still resolves, by the second attempt.
+DRIVER_REPO_PACKAGE_PREFIX = "scripts."
+DRIVER_TYPE_UNIDENTIFIABLE = "AGENT_MODEL_DRIVER_UNIDENTIFIABLE"
+
+
+def driver_type_id(driver: Any) -> str:
+    """The driver's STABLE, NON-SECRET, CROSS-PROCESS *type* identifier -- or REFUSE.
+
+    `""` for `driver is None`: a POSITIVE "no driver" statement, not an absence.
+
+        "<module, at most one leading 'scripts.' stripped>:<type(driver).__qualname__>"
+
+    accepted ONLY if it ROUND-TRIPS -- importing that module and walking that qualname in
+    THIS interpreter yields `type(driver)` ITSELF. The round trip is what makes the
+    string INJECTIVE rather than merely descriptive, and it is what rejects every way two
+    different classes could otherwise share one spelling:
+
+      * `type("Driver", (), {...})` built at run time is bound to NO module attribute (or
+        to a DIFFERENT object) -> the walk fails or resolves elsewhere -> REFUSED;
+      * a `<locals>` qualname (a class defined inside a function) cannot be walked ->
+        REFUSED;
+      * a class defined in `__main__` resolves HERE, but in a successor whose `__main__`
+        is a different entry point it resolves to a different object or not at all ->
+        that successor REFUSES rather than matching, which is the fail-closed direction.
+
+    `type(...).__name__` is deliberately NOT used: Python does not make `__name__`
+    unique, so `module_a.Driver` and `module_b.Driver` would persist as one string and a
+    successor could inject a DIFFERENT capable class under the same launch identity.
+
+    Refusing is a REFUSAL, never a fallback: a driver whose class cannot be named durably
+    may not open a model-aware run, because the launch record would otherwise bind a
+    string a DIFFERENT class could reproduce. Nothing here is secret -- an import path
+    and a class name, i.e. source-tree structure, never a token, endpoint or environment
+    value.
+    """
+    if driver is None:
+        return ""
+    cls = type(driver)
+    module = str(getattr(cls, "__module__", "") or "")
+    qualname = str(getattr(cls, "__qualname__", "") or "")
+    if not module or not qualname or "<" in qualname:
+        raise AgentProfileError(
+            f"{DRIVER_TYPE_UNIDENTIFIABLE}: {module}:{qualname} is not a durable class "
+            "identity; a model-selection driver must be a module-level class",
+            reason=DRIVER_TYPE_UNIDENTIFIABLE,
+        )
+    normalised = (
+        module[len(DRIVER_REPO_PACKAGE_PREFIX):]
+        if module.startswith(DRIVER_REPO_PACKAGE_PREFIX)
+        else module
+    )
+    identifier = f"{normalised}:{qualname}"
+    if cls not in _resolved_driver_types(identifier):
+        raise AgentProfileError(
+            f"{DRIVER_TYPE_UNIDENTIFIABLE}: {identifier!r} does not resolve back to this "
+            "class in this process; a dynamically created or function-local driver class "
+            "has no identity a durable record can bind",
+            reason=DRIVER_TYPE_UNIDENTIFIABLE,
+        )
+    return identifier
+
+
+def _resolved_driver_types(identifier: str) -> tuple[Any, ...]:
+    """Every class `identifier` resolves to, across BOTH layout spellings, in order.
+
+    BOTH spellings are reported rather than only the first, and that is load-bearing for
+    the round trip rather than tidiness. In this repository one source file is reachable
+    under TWO module names at once -- `deterministic_workflow.fake_adapter` and
+    `scripts.deterministic_workflow.fake_adapter` are the same `__file__` imported twice,
+    because the test lanes put both the repository root and `scripts/` on `sys.path` -- and
+    Python makes those two module objects hold two DISTINCT class objects. Accepting only
+    the first spelling would therefore refuse a driver imported under the other one, as
+    `AGENT_MODEL_DRIVER_UNIDENTIFIABLE`, even though both incarnations ARE the class the
+    identifier names. "The SAME class in the two layouts binds EQUAL" is the property the
+    identifier exists to have, so the round trip asks whether `type(driver)` is reachable
+    under EITHER spelling, not whether it is the first one tried.
+
+    Nothing about injectivity is given up: two different module-level classes still differ
+    in module or qualname and so still produce different identifiers, and a dynamically
+    created or function-local class is bound to no module attribute at all and is reachable
+    under NEITHER spelling. The residual limitation, stated rather than hidden: a top-level
+    package genuinely named the same as a `scripts.`-relative module would share one
+    identifier with it -- a consequence of the one-component stripping itself, not of this
+    function.
+    """
+    module_path, _, qualname = str(identifier or "").partition(":")
+    if not module_path or not qualname:
+        return ()
+    found: list[Any] = []
+    for candidate in (module_path, DRIVER_REPO_PACKAGE_PREFIX + module_path):
+        try:
+            obj: Any = importlib.import_module(candidate)
+        except Exception:  # noqa: BLE001 - absent in THIS layout; try the other one
+            continue
+        for part in qualname.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                break
+        if isinstance(obj, type) and obj not in found:
+            found.append(obj)
+    return tuple(found)
+
+
+def resolve_driver_type(identifier: str) -> Any:
+    """The inverse of `driver_type_id`, or `None`. IMPORTS a module; NEVER instantiates.
+
+    Answers the FIRST class the identifier resolves to; :func:`_resolved_driver_types`
+    answers all of them, which is what the round-trip check needs.
+    """
+    resolved = _resolved_driver_types(identifier)
+    return resolved[0] if resolved else None
 
 
 def validate_effective_identity(
