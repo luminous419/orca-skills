@@ -3650,6 +3650,23 @@ class OrcaRuntimeHarness:
         if row is not None:
             row.update(self._MODEL_ROW_CLEARED)
 
+    def invalidate_model_authority(self, terminal: str) -> None:
+        """PUBLIC: revoke this session's model verification AUTHORITY, keep its HISTORY.
+
+        OS-14 BUGFIX (review B2).  A caller that refuses an attempt AFTER
+        `verify_model_identity()` has already run cannot leave the session advertising a
+        verification it has just rejected: selection is the act that switches the session,
+        so by then the physical model is whatever the driver left it on.  The one existing
+        operation with exactly that meaning is `_stale_model_evidence()`, and this is its
+        public name -- no second copy, no new rule, and strictly a REVOCATION: it can only
+        ever make a later delivery MORE refused.
+
+        `_model_role_history` / `_model_session_history` are deliberately untouched, for
+        the reason `_stale_model_evidence()`'s own docstring gives: revoking authority is
+        the job, erasing history was the defect.
+        """
+        self._stale_model_evidence(terminal)
+
     def _gate_b_model_identity(
         self, *, task_id: str, terminal: str, role: str, phase: str, attempt: int
     ) -> dict[str, Any]:

@@ -1691,14 +1691,20 @@ class T3StaticProtectionTests(unittest.TestCase):
             "PAIR_PREPARATION_BINDING_UNVERIFIABLE",
             "PAIR_PREPARATION_LAUNCH_RECORD_ABSENT",
             "PAIR_PREPARATION_MODEL_DRIFT",
+            # The three members this correction run ADDED.  Each one only ever REFUSES a
+            # delivery that the shipped set allowed through, so the set grew in the
+            # fail-closed direction and no existing member moved.
+            "PAIR_PREPARATION_MODEL_HISTORY_CONFLICT",
             "PAIR_PREPARATION_MODEL_UNOBSERVED",
             "PAIR_PREPARATION_OUTCOME_UNKNOWN",
             "PAIR_PREPARATION_OWNERSHIP_MISMATCH",
             "PAIR_PREPARATION_RECORD_CORRUPT",
+            "PAIR_PREPARATION_RECORD_LOST",
             "PAIR_PREPARATION_SCOPE_UNRESOLVED",
             "PAIR_PREPARATION_SESSION_ABSENT",
             "PAIR_PREPARATION_SESSION_NOT_DISTINCT",
             "PAIR_PREPARATION_SESSION_UNVERIFIED",
+            "PAIR_PREPARATION_SESSION_USE_UNKNOWN",
         ])
 
     @staticmethod
@@ -2335,11 +2341,16 @@ class ChildProcessRoom(PairRoom):
             self._head(), "the predecessor committed a real checkpoint head")
         return launch
 
-    def predecessor_at_admission(self):
+    def predecessor_at_admission(self, *, driver="reference"):
         """A predecessor with BOTH roles `VERIFIED` that died at the admission boundary,
         before `create_task` -- the B9 window.  No Task was issued, so a successor's
-        lookup can prove absence honestly."""
-        launch = self.launch()
+        lookup can prove absence honestly.
+
+        ``driver`` is forwarded to `launch()` unchanged.  The driver CLASS is part of the
+        launch identity by design, so a re-entry test that needs a differently CONFIGURED
+        driver of the same class must be able to say which class the predecessor used.
+        """
+        launch = self.launch(driver=driver)
         original = launch.harness.create_task
         seen = {"calls": 0}
 
@@ -3137,7 +3148,14 @@ class T9RecordIntegrityTests(ChildProcessRoom):
         return self.project / "artifacts" / "runs" / run_id / ".pair_preparation.json"
 
     def write_entry(self, **overrides):
-        """Write ONE preparation entry directly, bypassing the store's validator."""
+        """Write ONE preparation entry directly, bypassing the store's validator.
+
+        The document is written with its COMPLETE section set (review F-001 made a
+        present document's section set exact), so every subcase below keeps testing the
+        thing its own name states -- an ENTRY, a schema version or a launch record -- and
+        not the section set.  Removing a section is its own subject and is covered by the
+        correction run's own section-removal regressions.
+        """
         entry = {key: "" for key in pause_store.PAIR_ENTRY_KEYS}
         entry.update({"run_id": RUN_ID, "phase": PHASE, "gate_iteration": "1",
                       "role": "worker", "stage": "CREATED", "create_attempt": "1",
@@ -3156,7 +3174,8 @@ class T9RecordIntegrityTests(ChildProcessRoom):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
             "schema_version": schema,
-            "pairs": {f"{PHASE}#1": {"worker": entry}}}), encoding="utf-8")
+            "pairs": {f"{PHASE}#1": {"worker": entry}},
+            "sessions": {}, "role_history": {}}), encoding="utf-8")
 
     def adopt_and_execute(self, *, profile_name="", driver=None, recorder=None,
                           risk="high", phases=(PHASE_UPPER,), run_id=RUN_ID,

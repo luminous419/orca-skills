@@ -263,7 +263,28 @@ turn cannot drift from the preflight turn within one process (unmeasured in the 
 direction); no claim that a held process survives arbitrary delay.
 
 **Change scope:** a new driver module; the engine step that delivers into a held process
-(**only if** D8 chooses that shape); no change to the common preparation code.
+(**only if** D8 chooses that shape).
+
+> **RETRACTION (OS-14 correction run).** This paragraph previously asserted that the held
+> `claude -p` preflight -> task path attaches with **no change to the common preparation
+> code**. That assertion is withdrawn: it is not established, and it was stated more
+> firmly than the evidence supports.
+>
+> Further changes to the common preparation code **may** be required, and whether they are
+> depends on two things this design has not settled: the **binding** between the process
+> that was verified and the process that actually receives the task, and the **lifetime**
+> of that binding across the interval between verification and delivery. Today preparation
+> calls `verify_model_identity(...)` for each role, holds no process and assumes no
+> liveness — so if D8 chooses the held-process shape, preparation would have to carry a
+> process handle (or a binding to one) from the verification through to delivery, which is
+> a process-ownership and cleanup contract it does not have. If instead D8 chooses
+> re-entry, the re-entry is `--resume`, which inherits the last selection silently and
+> needs its own re-verification at the delivery target; where that re-verification is
+> placed may also touch preparation.
+>
+> **This is to be settled under D8 (§5), not here.** Nothing in this retraction implements
+> a driver, changes a standalone switch, or makes a preparation change: it records that the
+> question is open and that the earlier "no change needed" statement is not a finding.
 
 **Alternatives and cost:** (B) is cheapest and already exists, but cannot satisfy the barrier
 at all — it is the right choice only if the answer to OS-14 is "do not verify", which the
@@ -347,7 +368,7 @@ takes.
 | Coupled decision | The exact code boundary | Alternative that keeps the common work independent |
 |---|---|---|
 | **D2** — does launching with the ticket's requested model count as this attempt's request? | the single `create_fake_terminal(...)` call inside the adapter's preparation step, where a model-pinned launch would have to replace a model-neutral one. Note `create_fake_terminal` records `requested_model` as a **separate** ledger field and never concatenates a model into `--command` (`orca_runtime_harness.py:2869-2890`) | **(taken)** keep preparation model-**neutral** and let the driver make its request against the session preparation created. Needs no D2. The alternative — a `launch_model=` keyword gated on D2 — also changes the reuse gate's condition-2 key, at a cost of one new seam plus one new reuse-gate case |
-| **D8** — execution lifetime | the `verify_model_identity(...)` call inside preparation, and whether the **same** process must then run the task | **(taken)** one self-contained driver call per role: preparation holds no process and assumes no liveness. The alternative — preparation hands the driver a process it must keep alive until delivery — gives preparation a process-ownership and cleanup contract it does not have today |
+| **D8** — execution lifetime | the `verify_model_identity(...)` call inside preparation, and whether the **same** process must then run the task | **(taken, for the reference driver only)** one self-contained driver call per role: preparation holds no process and assumes no liveness. The alternative — preparation hands the driver a process it must keep alive until delivery — gives preparation a process-ownership and cleanup contract it does not have today. **OS-14 correction run:** the earlier claim that the held `claude -p` path (§3, option (A)) attaches with no change to this code is **retracted**. Whether a change is needed depends on the **binding** between the verified process and the actual task recipient and on the **lifetime** of that binding, and that is to be settled **here, under D8** — not asserted in §3 |
 | **Proof-grade re-adoption of a prepared session across processes** | `pause_policy.resolve_prepared_terminal` and the prepared entry's `terminal_digest` | **(taken)** digest-proved adoption plus **mandatory re-verification** on every pass. A real driver may additionally need a **session-liveness** proof — is the agent process behind this terminal still the one that was verified? — which the durable record deliberately does **not** claim |
 
 ---

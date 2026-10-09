@@ -819,7 +819,7 @@ def iter_journal_stages() -> Iterator[str]:
 # OS-14 pair preparation: the two NEW durable documents
 # ======================================================================================
 # ---- the launch binding: WHICH KIND of launch opened this run ------------------------
-PAIR_BINDING_SCHEMA_VERSION = "os14.pair_launch_binding.v1"
+PAIR_BINDING_SCHEMA_VERSION = "os14.pair_launch_binding.v2"
 PAIR_BINDING_FILENAME = ".pair_launch_binding.json"
 PAIR_BINDING_KEYS = (
     "run_id", "runtime", "profile_name", "profile_source",
@@ -827,11 +827,19 @@ PAIR_BINDING_KEYS = (
     "routing_digest",              # "" iff model_aware == "false"
     "model_aware",                 # the STRING "true" or "false" -- never a bool
     "driver_type_id",              # the driver CLASS's normalised import path, "" for none
+    # OS-14 BUGFIX (review B3).  The run's "a preparation entry has been written at least
+    # once" MARKER, set ONCE, monotonically, by the preparation path itself and never
+    # cleared.  It lives HERE rather than in the preparation document because its whole
+    # job is to survive that document: a marker stored inside the record whose loss it
+    # detects detects nothing.  Deliberately NOT part of the launch IDENTITY (below), so
+    # setting it can never make a run's own binding mismatch itself.
+    "preparation_started_at",
     "recorded_by", "recorded_at",
 )
 PAIR_BINDING_MODEL_AWARE = ("true", "false")
 PAIR_BINDING_IDENTITY_KEYS = tuple(
-    key for key in PAIR_BINDING_KEYS if key not in ("recorded_by", "recorded_at"))
+    key for key in PAIR_BINDING_KEYS
+    if key not in ("recorded_by", "recorded_at", "preparation_started_at"))
 #: The LAUNCH IDENTITY: exactly the cells ``harness.routing_binding()`` emits, which is
 #: exactly what ``OrcaAdapter._assert_preparation_binding`` compares on adoption.  Derived
 #: from PAIR_BINDING_KEYS rather than re-spelled, so a cell added to the record in a later
@@ -840,7 +848,7 @@ PAIR_LAUNCH_IDENTITY_KEYS = tuple(
     key for key in PAIR_BINDING_IDENTITY_KEYS if key != "run_id")
 
 # ---- the preparation entries: WHAT was prepared for which pair ----------------------
-PAIR_PREPARATION_SCHEMA_VERSION = "os14.pair_preparation.v1"
+PAIR_PREPARATION_SCHEMA_VERSION = "os14.pair_preparation.v2"
 PAIR_PREPARATION_FILENAME = ".pair_preparation.json"
 PAIR_PREPARATION_STAGES = ("CREATE_INTENDED", "CREATE_REFUSED", "CREATED", "VERIFIED")
 PAIR_PREPARATION_ROLES = ("worker", "reviewer")
@@ -852,16 +860,84 @@ PAIR_ENTRY_KEYS = (
     "requested_model",                                  # the routing's DECLARATION
     "resolved_model_observed", "observed_at_run",       # prior-pass provenance
     "refusal_command", "refusal_error_code", "refusal_receipt_digest",
+    # OS-14 BUGFIX (review B1).  PROVENANCE of a create attempt that exists because the
+    # PREVIOUS session of this same role was refused reuse: which session it replaced,
+    # and the gate's own refusal names.  Written in the same `record()` call that
+    # publishes the new `CREATE_INTENDED`, so a superseding attempt can never be mistaken
+    # for a first one.
+    "supersedes_digest", "supersedes_reason",
     "recorded_by",
     "create_intended_at", "create_settled_at", "verified_at",
 )
 #: Cleared when a NEW create attempt is published, so a retry's ``CREATE_INTENDED`` never
-#: carries the previous attempt's observation or refusal.  Mirrors the harness's own
+#: carries the PREVIOUS ATTEMPT'S OWN result cells -- the digest of the session that
+#: attempt produced, that attempt's parsed refusal, that attempt's settle/verify stamps
+#: and that attempt's supersession provenance.  Mirrors the harness's own
 #: ``_MODEL_ROW_CLEARED`` discipline.
+#:
+#: OS-14 BUGFIX (review N3).  What it does NOT clear, and must not:
+#: ``resolved_model_observed`` / ``observed_at_run``.  Those are this RUN's MODEL HISTORY
+#: for the ``(phase, gate_iteration, role)`` slot, not one attempt's result, and the
+#: superseded comment claimed they were cleared when they never were.  Clearing them
+#: would turn a retry into a laundering step: refuse model-B on attempt 1, then retry and
+#: be accepted on attempt 2 because the only record that knew about model-A had just been
+#: erased.  The durable baseline a drift comparison reads lives in the ``role_history``
+#: section, which this set does not touch at all.
+#:
+#: SESSION USE is likewise untouched: it is filed per terminal DIGEST in the ``sessions``
+#: section, so a new create attempt cannot overwrite the past use state -- or the refusal
+#: grounds -- of the session it replaces.
 _PAIR_ENTRY_ATTEMPT_CLEARED = {
     "terminal_digest": "", "refusal_command": "", "refusal_error_code": "",
     "refusal_receipt_digest": "", "create_settled_at": "", "verified_at": "",
+    "supersedes_digest": "", "supersedes_reason": "",
 }
+
+# ---- OS-14 BUGFIX (review B1): the SESSION USE ledger --------------------------------
+#: Filed per terminal DIGEST, which is the only key that denotes one PHYSICAL session
+#: across processes, and APPEND-ONLY: this is the record that answers "has this session
+#: already been delivered to?", and an answer that can be overwritten by a later
+#: preparation pass answers nothing.
+#:
+#: Its own CLOSED stage set.  It touches, aliases and reinterprets neither
+#: :data:`PAIR_PREPARATION_STAGES` nor :data:`JOURNAL_STAGES`.
+PAIR_SESSION_USE_STAGES = ("DELIVERY_INTENDED", "DELIVERED")
+PAIR_SESSION_USE_KEYS = (
+    "run_id", "terminal_digest",                        # identity
+    "stage", "delivery_attempt",                        # progress (decimal string)
+    "phase", "gate_iteration", "role",                  # WHICH boundary used it
+    "intent_id", "dispatch_id",                         # WHICH dispatch used it
+    "previous_dispatch_ids",                            # every EARLIER use, comma-joined
+    "recorded_by", "intended_at", "settled_at",
+)
+
+# ---- OS-14 BUGFIX (review B2): the run-scoped ROLE MODEL HISTORY ---------------------
+#: One row per ``(phase, role)`` for the WHOLE run -- deliberately NOT per gate iteration,
+#: which is exactly the scope the in-memory ``_model_role_history`` had and the durable
+#: record did not.  WRITE-ONCE: the first positively verified resolved model of a
+#: ``(run, phase, role)`` is that slot's NON-DRIFT BASELINE, and a differing value is
+#: refused rather than recorded.
+#:
+#: HISTORY, never AUTHORITY.  Nothing reads this to decide that a session's model IS
+#: verified; it is read only to REFUSE a change.  Current verification authority is earned
+#: only by a positive re-verification through the live driver.
+PAIR_ROLE_HISTORY_KEYS = (
+    "run_id", "phase", "role", "resolved_model", "requested_model",
+    "first_gate_iteration", "recorded_by", "observed_at",
+)
+
+
+def terminal_use_digest(handle: str) -> str:
+    """The session-use ledger's key for a live handle.
+
+    ONE derivation, shared with the preparation entry's ``terminal_digest`` so a row
+    written for a handle and a row looked up for that handle cannot disagree.  A thin
+    re-export of :func:`pause_policy.terminal_digest`, kept here because this module owns
+    the document whose keys it spells and must not import the policy module at module
+    scope (``pause_policy`` already imports this one).
+    """
+    from . import pause_policy
+    return pause_policy.terminal_digest(handle)
 
 
 def _iso_now() -> str:
@@ -973,6 +1049,85 @@ def new_pair_entry(**fields: Any) -> dict[str, Any]:
     return validate_pair_entry(entry)
 
 
+def role_history_key(phase: Any, role: str) -> str:
+    """``<phase>#<role>`` -- ONE baseline per (run, phase, role).  ``#`` is reserved."""
+    if "#" in str(phase):
+        raise PairPreparationCorrupt(
+            "PAIR_PREPARATION_CORRUPT:phase may not contain '#'")
+    return f"{phase}#{role}"
+
+
+def validate_pair_session_use(row: Any) -> dict[str, Any]:
+    """Whole-or-nothing, the same discipline as :func:`validate_pair_entry`."""
+    if not isinstance(row, Mapping) or set(row) != set(PAIR_SESSION_USE_KEYS):
+        raise PairPreparationCorrupt(
+            "PAIR_SESSION_USE_CORRUPT:closed fields: "
+            f"{sorted(row) if isinstance(row, Mapping) else type(row).__name__}")
+    for key in PAIR_SESSION_USE_KEYS:
+        if not isinstance(row[key], str):
+            raise PairPreparationCorrupt(f"PAIR_SESSION_USE_CORRUPT:{key} type")
+    if row["stage"] not in PAIR_SESSION_USE_STAGES:
+        raise PairPreparationCorrupt(
+            f"PAIR_SESSION_USE_CORRUPT:unknown stage {row['stage']!r}")
+    if row["role"] not in PAIR_PREPARATION_ROLES:
+        raise PairPreparationCorrupt(
+            f"PAIR_SESSION_USE_CORRUPT:unknown role {row['role']!r}")
+    for key in ("run_id", "terminal_digest", "phase", "gate_iteration", "intent_id"):
+        if not row[key]:
+            raise PairPreparationCorrupt(f"PAIR_SESSION_USE_CORRUPT:identity {key}")
+    for key in ("gate_iteration", "delivery_attempt"):
+        value = row[key]
+        if not value.isdigit() or int(value) < 1:
+            raise PairPreparationCorrupt(
+                f"PAIR_SESSION_USE_CORRUPT:{key} {value!r} is not a decimal >= 1")
+    if row["stage"] == "DELIVERED" and not row["dispatch_id"]:
+        raise PairPreparationCorrupt(
+            "PAIR_SESSION_USE_CORRUPT:a DELIVERED use names the Dispatch that used it; "
+            "a use whose owner is unrecorded stays at DELIVERY_INTENDED, which reads as "
+            "USED WITH AN UNKNOWN OUTCOME and never as unused")
+    return dict(row)
+
+
+def new_pair_session_use(**fields: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {key: "" for key in PAIR_SESSION_USE_KEYS}
+    row["stage"] = "DELIVERY_INTENDED"
+    row["delivery_attempt"] = "1"
+    row.update(fields)
+    return validate_pair_session_use(row)
+
+
+def validate_pair_role_history(row: Any) -> dict[str, Any]:
+    """Whole-or-nothing, the same discipline as :func:`validate_pair_entry`."""
+    if not isinstance(row, Mapping) or set(row) != set(PAIR_ROLE_HISTORY_KEYS):
+        raise PairPreparationCorrupt(
+            "PAIR_ROLE_HISTORY_CORRUPT:closed fields: "
+            f"{sorted(row) if isinstance(row, Mapping) else type(row).__name__}")
+    for key in PAIR_ROLE_HISTORY_KEYS:
+        if not isinstance(row[key], str):
+            raise PairPreparationCorrupt(f"PAIR_ROLE_HISTORY_CORRUPT:{key} type")
+    if row["role"] not in PAIR_PREPARATION_ROLES:
+        raise PairPreparationCorrupt(
+            f"PAIR_ROLE_HISTORY_CORRUPT:unknown role {row['role']!r}")
+    for key in ("run_id", "phase", "role", "resolved_model"):
+        if not row[key]:
+            raise PairPreparationCorrupt(f"PAIR_ROLE_HISTORY_CORRUPT:identity {key}")
+    if "#" in row["phase"]:
+        raise PairPreparationCorrupt(
+            "PAIR_ROLE_HISTORY_CORRUPT:phase may not contain '#'")
+    value = row["first_gate_iteration"]
+    if not value.isdigit() or int(value) < 1:
+        raise PairPreparationCorrupt(
+            f"PAIR_ROLE_HISTORY_CORRUPT:first_gate_iteration {value!r}")
+    return dict(row)
+
+
+def new_pair_role_history(**fields: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {key: "" for key in PAIR_ROLE_HISTORY_KEYS}
+    row["first_gate_iteration"] = "1"
+    row.update(fields)
+    return validate_pair_role_history(row)
+
+
 class FilePairBindingStore:
     """The run's LAUNCH RECORD.  Written ONCE, at run OPEN, by the launcher.
 
@@ -1028,6 +1183,42 @@ class FilePairBindingStore:
                 "schema_version": PAIR_BINDING_SCHEMA_VERSION, "binding": candidate})
             return deepcopy(candidate)
 
+    def preparation_started(self) -> str:
+        """The run's "a preparation entry has been written at least once" marker, or ``""``.
+
+        OS-14 BUGFIX (review B3).  ``""`` means NO entry was ever written for this run,
+        and because a ``CREATE_INTENDED`` entry is written strictly BEFORE every
+        ``terminal create``, that is a POSITIVE statement that preparation produced no
+        external effect.  A non-empty value together with an EMPTY preparation document is
+        therefore the one state that proves the document was LOST -- which is exactly the
+        statement the preparation document itself cannot make about its own absence.
+        """
+        with self._section.locked():
+            found = self._read()
+            return "" if found is None else found["preparation_started_at"]
+
+    def mark_preparation_started(self) -> str:
+        """Set the marker ONCE; return the value that stands.  Monotonic and one-way.
+
+        Mints NO binding: a run with no launch record is refused here rather than having
+        one manufactured for it, so this method cannot create the authority it is supposed
+        to be checked against.  It can only ever make the B3 gate MORE strict -- there is
+        no path that clears it.
+        """
+        with self._section.locked():
+            found = self._read()
+            if found is None:
+                raise PairPreparationCorrupt(
+                    "PAIR_BINDING_ABSENT:a preparation marker is an annotation on an "
+                    "EXISTING launch record, never a way to create one")
+            if found["preparation_started_at"]:
+                return found["preparation_started_at"]       # the FIRST statement stands
+            found["preparation_started_at"] = _iso_now()
+            validate_pair_binding(self.run_id, found)
+            write_json_document(self.path, {
+                "schema_version": PAIR_BINDING_SCHEMA_VERSION, "binding": found})
+            return found["preparation_started_at"]
+
 
 class FilePairPreparationStore:
     """One row per ``(phase, gate_iteration, role)``.
@@ -1050,18 +1241,59 @@ class FilePairPreparationStore:
         self.run_id = run_id
         self.owner_id = owner_id or default_owner_id()
 
+    #: The document's three CLOSED sections.  ``pairs`` is the per-(phase, gate_iteration,
+    #: role) preparation entry; ``sessions`` is the APPEND-ONLY per-digest session USE
+    #: ledger (review B1); ``role_history`` is the WRITE-ONCE per-(phase, role) non-drift
+    #: baseline (review B2).  An unknown top-level key is corruption, as before -- and so,
+    #: since review F-001, is a MISSING one: the set below is EXACT, not a superset of
+    #: whatever a present document happens to carry.
+    _SECTIONS = ("pairs", "sessions", "role_history")
+
     def _read(self) -> dict[str, Any]:
+        """The ``pairs`` section.  Kept as the name every existing caller reads."""
+        return self._read_document()["pairs"]
+
+    def _read_document(self) -> dict[str, dict[str, Any]]:
         document = read_json_document(self.path,
                                       schema_version=PAIR_PREPARATION_SCHEMA_VERSION,
                                       corrupt_exc=PairPreparationCorrupt)
         if not document:
-            return {}
-        if set(document) - {"schema_version", "pairs"}:
+            # ABSENT FILE -- the ONE state in which no section can be missing, because
+            # there is no document for it to be missing from.  `read_json_document`
+            # returns ``{}`` for ``FileNotFoundError`` ALONE: an unreadable, malformed or
+            # version-incompatible file RAISES there, so this branch cannot be reached by
+            # a document that exists.  Whether this absence is a GENUINE first write or a
+            # LOST document is not decided here and never can be -- that is the launch
+            # record's B3 marker's job (`OrcaAdapter._assert_preparation_not_lost`).
+            return {section: {} for section in self._SECTIONS}
+        if set(document) - {"schema_version", *self._SECTIONS}:
             raise PairPreparationCorrupt("PAIR_PREPARATION_CORRUPT:top-level keys")
-        pairs = document.get("pairs")
-        if not isinstance(pairs, dict):
-            raise PairPreparationCorrupt("PAIR_PREPARATION_CORRUPT:pairs container")
-        for key, slot in pairs.items():
+        # ---- OS-14 BUGFIX (review F-001): a PRESENT document's section set is EXACT ----
+        # `_write()` is this document's ONLY writer and emits all three sections on every
+        # write, so a present document that lacks one was TRUNCATED after the fact.  Read
+        # with `document.get(section, {})` that truncation became positive EMPTY state --
+        # "this session was never delivered to" (`sessions`) and "this role has no
+        # baseline, so the first observation may establish one" (`role_history`) -- which
+        # are exactly the two statements review B1 and B2 require a MISSING record never
+        # to make.  So the absence is refused BY NAME, before any section is interpreted
+        # and therefore before any session creation, Task creation or delivery.
+        missing = [section for section in self._SECTIONS if section not in document]
+        if missing:
+            raise PairPreparationCorrupt(
+                "PAIR_PREPARATION_RECORD_CORRUPT:this run's preparation document exists "
+                f"and is missing the required section(s) {', '.join(missing)}.  Every "
+                "write of this document emits all of "
+                f"{', '.join(self._SECTIONS)}, so a section that is gone was REMOVED -- "
+                "and a removed use/history record is unknown, never 'unused' and never "
+                "'no baseline yet'")
+        sections: dict[str, dict[str, Any]] = {}
+        for section in self._SECTIONS:
+            found = document[section]
+            if not isinstance(found, dict):
+                raise PairPreparationCorrupt(
+                    f"PAIR_PREPARATION_CORRUPT:{section} container")
+            sections[section] = found
+        for key, slot in sections["pairs"].items():
             if not isinstance(slot, dict):
                 raise PairPreparationCorrupt("PAIR_PREPARATION_CORRUPT:pair container")
             for role, entry in slot.items():
@@ -1073,14 +1305,28 @@ class FilePairPreparationStore:
                                     validated["gate_iteration"]) != key):
                     raise PairPreparationCorrupt(
                         "PAIR_PREPARATION_CORRUPT:entry identity")
-        return pairs
+        for digest, row in sections["sessions"].items():
+            if validate_pair_session_use(row)["terminal_digest"] != digest:
+                raise PairPreparationCorrupt("PAIR_SESSION_USE_CORRUPT:row identity")
+        for key, row in sections["role_history"].items():
+            validated = validate_pair_role_history(row)
+            if role_history_key(validated["phase"], validated["role"]) != key:
+                raise PairPreparationCorrupt("PAIR_ROLE_HISTORY_CORRUPT:row identity")
+        return sections
 
-    def _write(self, pairs: dict[str, Any]) -> None:
+    def _write(self, pairs: dict[str, Any], sections: dict[str, Any] | None = None) -> None:
         for slot in pairs.values():
             for entry in slot.values():
                 validate_pair_entry(entry)
+        document = dict(sections or self._read_document())
+        document["pairs"] = pairs
+        for digest, row in document["sessions"].items():
+            validate_pair_session_use(row)
+        for key, row in document["role_history"].items():
+            validate_pair_role_history(row)
         write_json_document(self.path, {
-            "schema_version": PAIR_PREPARATION_SCHEMA_VERSION, "pairs": pairs})
+            "schema_version": PAIR_PREPARATION_SCHEMA_VERSION,
+            **{section: document[section] for section in self._SECTIONS}})
 
     def pairs(self) -> dict[str, dict[str, dict[str, Any]]]:
         with self._section.locked():
@@ -1116,7 +1362,8 @@ class FilePairPreparationStore:
                 f"PAIR_PREPARATION_CORRUPT:unknown stage {stage!r}")
         key = pair_key(phase, gate_iteration)
         with self._section.locked():
-            pairs = self._read()
+            sections = self._read_document()
+            pairs = sections["pairs"]
             slot = pairs.setdefault(key, {})
             existing = slot.get(role)
             if existing is None:
@@ -1152,8 +1399,149 @@ class FilePairPreparationStore:
                 entry["recorded_by"] = self.owner_id
                 entry = validate_pair_entry(entry)
             slot[role] = entry
-            self._write(pairs)
+            self._write(pairs, sections)
             return deepcopy(entry)
+
+
+    # ---- OS-14 BUGFIX (review B1): the SESSION USE ledger ---------------------------
+    def session_use(self, terminal_digest: str) -> dict[str, Any] | None:
+        """What this run has recorded about DELIVERING to this physical session.
+
+        ``None`` means this document holds NO use row for the session.  In a document at
+        :data:`PAIR_PREPARATION_SCHEMA_VERSION` that is a POSITIVE statement that the
+        session was never delivered to, because the writer below records
+        ``DELIVERY_INTENDED`` strictly BEFORE the delivery.  It is NOT a statement any
+        OLDER document can make -- which is exactly why the schema version moved: an
+        earlier document is refused as corrupt rather than read as "unused".
+        """
+        with self._section.locked():
+            found = self._read_document()["sessions"].get(terminal_digest)
+            return deepcopy(found) if found is not None else None
+
+    def sessions(self) -> dict[str, dict[str, Any]]:
+        with self._section.locked():
+            return deepcopy(self._read_document()["sessions"])
+
+    def record_session_use(self, terminal_digest: str, *, stage: str, phase: Any,
+                           gate_iteration: Any, role: str, intent_id: str,
+                           dispatch_id: str = "",
+                           delivery_attempt: Any | None = None) -> dict[str, Any]:
+        """Record one session USE.  APPEND-ONLY in every direction that matters.
+
+        Within one ``delivery_attempt`` the stage is monotonic
+        (``DELIVERY_INTENDED`` -> ``DELIVERED``) and never goes back.  A LATER delivery of
+        the same session carries ``delivery_attempt + 1`` and re-enters
+        ``DELIVERY_INTENDED``, and the dispatch id of every earlier use is APPENDED to
+        ``previous_dispatch_ids`` rather than overwritten -- so a reused session's past
+        is still readable, which is what "never overwrites past use state" means as code.
+        """
+        if stage not in PAIR_SESSION_USE_STAGES:
+            raise PairPreparationCorrupt(
+                f"PAIR_SESSION_USE_CORRUPT:unknown stage {stage!r}")
+        if not terminal_digest:
+            raise PairPreparationCorrupt("PAIR_SESSION_USE_CORRUPT:identity digest")
+        with self._section.locked():
+            sections = self._read_document()
+            rows = sections["sessions"]
+            existing = rows.get(terminal_digest)
+            common = {"phase": str(phase), "gate_iteration": str(gate_iteration),
+                      "role": role, "intent_id": intent_id,
+                      "recorded_by": self.owner_id}
+            if existing is None:
+                row = new_pair_session_use(
+                    run_id=self.run_id, terminal_digest=terminal_digest, stage=stage,
+                    delivery_attempt=str(1 if delivery_attempt is None
+                                         else delivery_attempt),
+                    dispatch_id=dispatch_id, intended_at=_iso_now(),
+                    settled_at=_iso_now() if stage == "DELIVERED" else "", **common)
+            else:
+                old_attempt = int(existing["delivery_attempt"])
+                new_attempt = int(old_attempt if delivery_attempt is None
+                                  else delivery_attempt)
+                old_rank = (old_attempt,
+                            PAIR_SESSION_USE_STAGES.index(existing["stage"]))
+                new_rank = (new_attempt, PAIR_SESSION_USE_STAGES.index(stage))
+                if new_rank <= old_rank:
+                    raise PairPreparationCorrupt(
+                        "PAIR_SESSION_USE_CORRUPT:non-monotonic use "
+                        f"{old_rank} -> {new_rank}; a session's recorded use is "
+                        "append-only and is never rewound or re-stated")
+                row = dict(existing)
+                if new_attempt > old_attempt:
+                    if stage != "DELIVERY_INTENDED":
+                        raise PairPreparationCorrupt(
+                            "PAIR_SESSION_USE_CORRUPT:a new delivery attempt is "
+                            "published as DELIVERY_INTENDED before its effect")
+                    earlier = [part for part in
+                               (row["previous_dispatch_ids"], row["dispatch_id"])
+                               if part]
+                    row["previous_dispatch_ids"] = ",".join(earlier)
+                    row["dispatch_id"] = ""
+                    row["settled_at"] = ""
+                    row["intended_at"] = _iso_now()
+                row.update(common)
+                row["delivery_attempt"] = str(new_attempt)
+                row["stage"] = stage
+                if dispatch_id:
+                    row["dispatch_id"] = dispatch_id
+                if stage == "DELIVERED":
+                    row["settled_at"] = _iso_now()
+                row = validate_pair_session_use(row)
+            rows[terminal_digest] = row
+            self._write(sections["pairs"], sections)
+            return deepcopy(row)
+
+    # ---- OS-14 BUGFIX (review B2): the run-scoped ROLE MODEL HISTORY ----------------
+    def role_history(self, phase: Any, role: str) -> dict[str, Any] | None:
+        """This run's NON-DRIFT BASELINE for ``(phase, role)``, or ``None``.
+
+        Run-scoped by construction: the document lives under this run's own root and
+        every row carries this run's id, so a genuinely new run starts with no baseline
+        and may resolve a role to a different model.  ``None`` is "no baseline yet", which
+        is the only state in which a first observation may establish one.
+        """
+        with self._section.locked():
+            found = self._read_document()["role_history"].get(
+                role_history_key(phase, role))
+            return deepcopy(found) if found is not None else None
+
+    def role_histories(self) -> dict[str, dict[str, Any]]:
+        with self._section.locked():
+            return deepcopy(self._read_document()["role_history"])
+
+    def record_role_history(self, phase: Any, role: str, resolved_model: str, *,
+                            requested_model: str = "",
+                            gate_iteration: Any = 1) -> dict[str, Any]:
+        """Establish, or re-confirm, this ``(run, phase, role)`` baseline.  WRITE-ONCE.
+
+        An EQUAL value re-records as a no-op, which is what every later accepted
+        verification of the same role is.  A DIFFERING value is REFUSED here rather than
+        recorded: this store does not hold both, and a baseline that could be replaced by
+        the value it is supposed to refuse would be no baseline at all.  The caller
+        compares first and never reaches this with a drifted value; the refusal is the
+        second lock on the same invariant.
+        """
+        key = role_history_key(phase, role)
+        with self._section.locked():
+            sections = self._read_document()
+            rows = sections["role_history"]
+            existing = rows.get(key)
+            if existing is not None:
+                if existing["resolved_model"] != resolved_model:
+                    raise PairPreparationCorrupt(
+                        f"PAIR_ROLE_HISTORY_CONFLICT:{key} is already bound to "
+                        f"{existing['resolved_model']!r} in this run and this process "
+                        f"resolved {resolved_model!r}; a role's resolved model is a NEW "
+                        "RUN's business, never an overwrite under this run's own name")
+                return deepcopy(existing)        # the FIRST baseline's provenance stands
+            row = new_pair_role_history(
+                run_id=self.run_id, phase=str(phase), role=role,
+                resolved_model=resolved_model, requested_model=requested_model,
+                first_gate_iteration=str(gate_iteration), recorded_by=self.owner_id,
+                observed_at=_iso_now())
+            rows[key] = row
+            self._write(sections["pairs"], sections)
+            return deepcopy(row)
 
 
 def pair_binding_for(run_id: str, *, artifact_base: str | os.PathLike[str],
