@@ -752,7 +752,7 @@ still design only.
 | Document | Was | Now |
 | --- | --- | --- |
 | `.pair_launch_binding.json` | `os14.pair_launch_binding.v1` | `os14.pair_launch_binding.v2` |
-| `.pair_preparation.json` | `os14.pair_preparation.v1` | `os14.pair_preparation.v2` |
+| `.pair_preparation.json` | `os14.pair_preparation.v1` | `os14.pair_preparation.v3` |
 
 A document at the older version is refused as `PAIR_PREPARATION_RECORD_CORRUPT`
 (`INCOMPATIBLE_DURABLE_STORE`) and is **never** read as "nothing was prepared", "a legacy
@@ -795,13 +795,48 @@ replaces.
 
 | Recorded state | Read as | What may happen |
 | --- | --- | --- |
-| no row for this digest | UNUSED | first delivery proceeds, as before |
+| no row, and no entry claims one | UNUSED | first delivery proceeds, as before |
+| no row, but an entry **claims** one | RECORD LOST | `PAIR_PREPARATION_RECORD_CORRUPT` (`PAIR_SESSION_USE_RECORD_LOST`) |
 | `DELIVERY_INTENDED` (no `dispatch_id`) | USED, OUTCOME UNKNOWN | `PAIR_PREPARATION_SESSION_USE_UNKNOWN` |
 | `DELIVERED` with a `dispatch_id` | USED | re-delivery **only** if the shipped reuse gate permits it |
 
-"No row" is a positive statement only in a v2 document, because the v2 writer records
-`DELIVERY_INTENDED` strictly before the delivery. It is not a statement any older document
-can make, which is why the schema version had to move.
+**What makes "no row" a positive statement, exactly.** Two invariants, not one, and the
+second was added in correction round 2 after the Final Adversarial Review reproduced its
+absence:
+
+1. the writer records `DELIVERY_INTENDED` strictly **before** the delivery, so a delivery
+   that happened has a row; and
+2. every row the writer creates is **claimed** by the pair entry it was written for — the
+   entry cell `session_use_digests`, comma-joined and append-only — and the claim and the
+   row are published by **one** atomic document write, so "a claim exists and its row does
+   not" cannot be produced by any interleaving of the writers, not even by a crash between
+   two writes, because there is only one write. `_read_document` refuses the **whole**
+   document when a claimed row is gone.
+
+The first invariant alone was not enough and the review proved it: with all three sections
+present and every other row intact, removing one required per-digest row still made the
+reader answer "this session was never delivered to" for an already-delivered session, so a
+validation repair re-delivered to it without the reuse gate being asked and the run reached
+`COMPLETED`. A section's presence says nothing about its rows.
+
+The claim lives on the **entry**, not in a sibling section, so it cannot be lost
+independently of the entry whose session it is about; it is **monotone** (a superseding
+`create_attempt` adds its new digest and keeps the superseded one's, and
+`_PAIR_ENTRY_ATTEMPT_CLEARED` does not touch it); and it does **not** misclassify a
+genuinely prepared-but-undispatched session, which has no row because none was ever
+written, so nothing claims it and nothing is missing.
+
+A lost row is reported under the established, closed `PAIR_PREPARATION_RECORD_CORRUPT`
+name — exactly as a removed **section** is — with the specific record named in the
+message; the adapter's closed refusal-code set deliberately gained no member. Internally it
+is its own exception class, `PairSessionUseRecordLost`, a subclass of
+`PairPreparationCorrupt`, so every caller that already fails closed on an unreadable
+document fails closed on a lost row too, unchanged.
+
+Because the entry gained a cell, a `.pair_preparation.json` written before this round holds
+use rows that no entry claims — so **its** missing rows would be undetectable. That is why
+the preparation schema version moved a second time, to
+`os14.pair_preparation.v3`: such a document is refused outright rather than read.
 
 Re-use of a used session is decided by the shipped gate and by nothing else:
 `OrcaRuntimeHarness.terminal_for_next_dispatch`, which is `reuse_eligible()`'s one
@@ -828,18 +863,36 @@ scope the in-memory `_model_role_history` had and the durable record did not.
   earned only by a positive re-verification through the live driver.
 - It is compared **before** a new identity is left in an approved state and **before** the
   Task is created: the comparison runs inside pair preparation, which is strictly before
-  `create_task`.
-- On refusal the session's current authority is **revoked**
+  `create_task`. Since correction round 2 the **row-presence reconciliation** below runs
+  earlier still — before the first `terminal list`, the first `terminal create`, the first
+  adoption and the first `verify_model_identity` of the round, so a refusal on that path
+  creates no session at all.
+- On refusal **after selection** the session's current authority is **revoked**
   (`OrcaRuntimeHarness.invalidate_model_authority`, the public name of the existing
   `_stale_model_evidence`) and the history is **preserved**. Selection is the act that
   switches the session, so a post-selection refusal must not leave it advertising a
-  verification that was just rejected.
+  verification that was just rejected. The reconciliation path needs no revocation: it
+  runs before any session exists, so there is no authority yet to revoke.
 - A **missing or contradictory** baseline is `PAIR_PREPARATION_MODEL_HISTORY_CONFLICT`,
-  never an opportunity to mint a new one. The baseline is written before every entry
-  observation, so an observation with no baseline behind it means a required record is
-  gone.
+  never an opportunity to mint a new one. The baseline row is written **before** every
+  entry observation, so an observation standing with no row behind it means a required
+  record is gone.
+- **Which observations count: every gate iteration of the run, not only the current one.**
+  Correction round 2's correction, after the Final Adversarial Review reproduced the gap.
+  Reading the baseline row against the *current* entry alone made the row's own presence
+  uncheckable precisely at an iteration boundary, where the current entry is legitimately
+  absent: with the `role_history` **section** present and only the one required row
+  removed, both legs read empty although the previous iteration's `VERIFIED` entry proved,
+  on the same disk, that a baseline had been established — and the drifted identity was
+  then minted as the new write-once baseline, stored as a `VERIFIED` observation, and the
+  row recreated with `first_gate_iteration` pointing at the later iteration. The row is now
+  reconciled against **every** entry for the same `(run, phase, role)` in `pairs`
+  (`FilePairPreparationStore.role_observations`), and any observation standing with no row,
+  or disagreeing with it, is that named refusal.
 - A **genuinely new run** gets an independent baseline: the document is run-scoped and
   every row carries its run id, so a role may resolve to a different model in a new run.
+  The cross-iteration reconciliation is run-scoped for the same reason — it reads only the
+  entries of the document under that run's own root.
 - The narrower per-iteration leg (`resolved_model_observed` on the entry) is retained and
   still compared. It is never cleared by a new `create_attempt`.
 

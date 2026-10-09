@@ -52,6 +52,22 @@ PAIR_PREPARATION_REFUSAL_CODES = frozenset({        # CLOSED.  The complete set.
 })
 
 
+def _observed_detail(observed: dict[str, str]) -> str:
+    """``{"1": "<model-a>"}`` -> ``"gate iteration 1 -> '<model-a>'"``.
+
+    OS-14 BUGFIX (review R2).  Ordered by the gate iteration as a NUMBER -- every stored
+    key is a validated decimal -- so the refusal message a reader or a test sees is
+    deterministic rather than dict-ordered.  A non-decimal key cannot come from the
+    document (the entry validator refuses one) and is ordered last rather than raising:
+    this function only ever builds the TEXT of a refusal, and a refusal must not become a
+    ValueError on its way out.
+    """
+    def order(item: tuple[str, str]) -> tuple[int, int, str]:
+        return (0, int(item[0]), "") if item[0].isdigit() else (1, 0, item[0])
+    return "; ".join(f"gate iteration {round_} -> {model!r}" for round_, model
+                     in sorted(observed.items(), key=order))
+
+
 def _OrcaCommandRefused() -> type[BaseException]:
     """The typed refusal class, resolved lazily; ``Exception`` when the runtime is absent.
 
@@ -545,6 +561,19 @@ class OrcaAdapter:
             raise                                   # unreachable; _refuse always raises
         # ---- OS-14 BUGFIX (review B3): an ABSENT record is not a FIRST preparation ----
         self._assert_preparation_not_lost(prepared_any=prepared_any)
+        # ---- OS-14 BUGFIX (review R2): the MODEL HISTORY, before ANY effect -----------
+        # Hoisted out of the verification loop below, which is where it used to run and
+        # which is already too late: `_prepare_role` CREATES sessions, so a run whose
+        # required baseline row had been removed created two iteration-2 sessions (and,
+        # with the shipped engine, a Task) before the refusal.  This reads nothing but the
+        # durable document, so it can run here -- strictly before the first `terminal
+        # list`, the first `terminal create`, the first adoption, the first
+        # `verify_model_identity` and therefore before any selection has switched a
+        # session's model at all.  Which is also why no authority has to be revoked on
+        # this path: there is none yet to revoke.
+        baselines = {role: self._durable_model_baseline(
+            store, phase=phase, attempt=attempt, role=role, entry=entries[role])
+            for role in _PAIR_ROLES}
         # The listing is read ONCE, and ONLY when something was already prepared: a first
         # pass has no title and no digest to resolve, so it issues no `terminal list`.
         listing: Any = None
@@ -565,8 +594,7 @@ class OrcaAdapter:
                 f"{attempt}; one physical session cannot be both sides of a pair")
         # ---- verification: BOTH roles, UNCONDITIONALLY, on EVERY pass ---------------
         for role in _PAIR_ROLES:
-            expected = self._durable_model_baseline(
-                store, phase=phase, attempt=attempt, role=role, entry=entries[role])
+            expected = baselines[role]          # reconciled BEFORE any session existed
             declared = self.harness.resolved_agent_model(role, phase)
             self.harness.verify_model_identity("", handles[role], role=role, phase=phase,
                                                attempt=attempt)
@@ -692,40 +720,67 @@ class OrcaAdapter:
                                 entry: dict[str, Any] | None) -> str:
         """(B2) This ``(run, phase, role)``'s durable NON-DRIFT baseline, or ``""``.
 
-        Two durable legs, and the RUN-scoped one is the authority.  The entry cell
-        ``resolved_model_observed`` is the narrower leg -- it is scoped to ONE gate
-        iteration, which is exactly why it was empty at the next iteration and the
-        drifted value was stored as verified.  The ``role_history`` row is scoped to the
-        whole run, so it survives an iteration, a process and a session change.
+        The ``role_history`` row is the RUN-scoped authority: it survives an iteration, a
+        process and a session change.  An entry's ``resolved_model_observed`` is one GATE
+        ITERATION's accepted observation -- the narrow leg, and exactly why it was empty
+        at the next iteration and the drifted value got stored as verified.
 
-        Both legs are read, and a DISAGREEMENT between them is a named refusal rather
-        than a choice: a document that contradicts itself about what this role resolved to
-        does not get to have one of its two answers picked, and an observation with no
-        baseline behind it means the baseline the writer always writes first is missing.
-        Neither is an opportunity to mint a new one.
+        OS-14 BUGFIX (review R2).  The observation leg is now read for EVERY gate
+        iteration of this ``(run, phase, role)``, not only the current one.  Reading the
+        current entry alone made the ROW's presence uncheckable precisely at an iteration
+        boundary, where the current entry is legitimately absent: removing the one
+        required row left both legs empty while iteration 1's own ``VERIFIED`` entry, on
+        the same disk, still proved a baseline had been established -- and the drifted
+        value was then minted as the new write-once baseline.
+
+        So the row's PRESENCE is reconciled against every durable prior observation, and
+        both failures are named refusals rather than choices:
+
+        * any observation stands and there is NO row -> the row the writer always writes
+          FIRST is missing.  A missing required record is not a licence to establish a new
+          one, at this gate iteration or any later one.
+        * the row and any observation DISAGREE -> the run's own history contradicts
+          itself, and this process does not get to pick one of its two answers.
+
+        ``""`` -- "no baseline, a first observation may establish one" -- is returned only
+        when this run has recorded NO observation of this ``(phase, role)`` anywhere.  A
+        genuinely new run reads its own empty document and gets exactly that.
         """
-        previous = (entry or {}).get("resolved_model_observed") or ""
         try:
+            # Two reads, and this ORDER is the strict one: were a concurrent writer to add
+            # a baseline row between them, reading the row FIRST means this pass still
+            # sees the row-less state and still refuses.  The other order could see a row
+            # that the observations it then reads do not yet account for.
             history = store.role_history(phase, role)
+            observed = dict(store.role_observations(phase, role))
         except pause_store.PauseStoreError as exc:
             self._refuse_preparation("PAIR_PREPARATION_RECORD_CORRUPT", str(exc))
             return ""                               # unreachable; _refuse always raises
         baseline = (history or {}).get("resolved_model") or ""
-        if previous and not baseline:
+        previous = (entry or {}).get("resolved_model_observed") or ""
+        if previous:
+            # The caller's own entry, taken from the SAME read that drove this pass, so
+            # this method's answer cannot disagree with the entry the caller will promote.
+            observed[str(attempt)] = previous
+        if observed and not baseline:
             self._refuse_preparation(
                 "PAIR_PREPARATION_MODEL_HISTORY_CONFLICT",
-                f"{phase!r} attempt {attempt} {role}: this gate round's entry records the "
-                f"observation {previous!r} and this run holds NO (phase, role) baseline "
-                "for it.  The baseline is written before every observation, so its "
-                "absence means a required record is missing -- which is never a licence "
-                "to establish a new one")
-        if previous and baseline and previous != baseline:
+                f"{phase!r} attempt {attempt} {role}: this run's own preparation entries "
+                f"record the accepted observation(s) {_observed_detail(observed)} and "
+                "this run holds NO (phase, role) baseline row for them.  The baseline is "
+                "written BEFORE every observation, so a row that is absent while an "
+                "observation still stands means a REQUIRED RECORD IS MISSING -- which is "
+                "never a licence to establish a new one")
+        disagreeing = {round_: model for round_, model in observed.items()
+                       if model != baseline}
+        if baseline and disagreeing:
             self._refuse_preparation(
                 "PAIR_PREPARATION_MODEL_HISTORY_CONFLICT",
-                f"{phase!r} attempt {attempt} {role}: this run's (phase, role) baseline is "
-                f"{baseline!r} and this gate round's entry records {previous!r}; the run's "
-                "own history contradicts itself and this process does not pick one")
-        return baseline or previous
+                f"{phase!r} attempt {attempt} {role}: this run's (phase, role) baseline "
+                f"row is {baseline!r} and this run's own preparation entries record "
+                f"{_observed_detail(disagreeing)}; the run's own history contradicts "
+                "itself and this process does not pick one")
+        return baseline
 
     def _revoke_model_authority(self, handle: str) -> None:
         """Revoke the session's model verification AUTHORITY; keep its HISTORY.
@@ -824,7 +879,13 @@ class OrcaAdapter:
 
         The rules this encodes, exactly:
 
-        * ``session_use`` absent -> UNUSED -> first delivery, no gate involved.
+        * ``session_use`` absent -> UNUSED -> first delivery, no gate involved.  OS-14
+          BUGFIX (review R1): this reading is now EARNED rather than assumed.  Every row
+          the writer creates is CLAIMED by its own pair entry in the same atomic write,
+          and the document reader refuses outright when a claimed row is gone -- so a
+          REMOVED row never reaches this method, and "absent" means the document itself
+          states no row was ever written.  A genuinely prepared-but-undispatched session
+          is unaffected: nothing claims it, so nothing is missing.
         * ``session_use`` present but not ``DELIVERED`` -> USED WITH AN UNKNOWN OUTCOME ->
           NAMED refusal.  Unknown use is never read as unused.
         * ``session_use`` at ``DELIVERED`` -> the shipped reuse gate decides, through its

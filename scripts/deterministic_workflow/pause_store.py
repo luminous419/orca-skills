@@ -848,7 +848,7 @@ PAIR_LAUNCH_IDENTITY_KEYS = tuple(
     key for key in PAIR_BINDING_IDENTITY_KEYS if key != "run_id")
 
 # ---- the preparation entries: WHAT was prepared for which pair ----------------------
-PAIR_PREPARATION_SCHEMA_VERSION = "os14.pair_preparation.v2"
+PAIR_PREPARATION_SCHEMA_VERSION = "os14.pair_preparation.v3"
 PAIR_PREPARATION_FILENAME = ".pair_preparation.json"
 PAIR_PREPARATION_STAGES = ("CREATE_INTENDED", "CREATE_REFUSED", "CREATED", "VERIFIED")
 PAIR_PREPARATION_ROLES = ("worker", "reviewer")
@@ -866,6 +866,17 @@ PAIR_ENTRY_KEYS = (
     # publishes the new `CREATE_INTENDED`, so a superseding attempt can never be mistaken
     # for a first one.
     "supersedes_digest", "supersedes_reason",
+    # OS-14 BUGFIX (review R1).  The USE-LEDGER CLAIM: every terminal digest this entry
+    # has recorded a row for in the `sessions` section, comma-joined and APPEND-ONLY.
+    # `record_session_use` publishes the claim and the row in ONE atomic document write,
+    # so a claim with no row cannot be produced by any interleaving of this module's
+    # writers -- which is what makes a row's later ABSENCE detectable at all.  Without
+    # it the `sessions` section is only self-consistent: a REMOVED row and a
+    # never-written row read identically, and `session_use()` answered the first with
+    # `None`, i.e. "this session was never delivered to".  Deliberately on the ENTRY
+    # rather than in a sibling section, so it cannot be lost INDEPENDENTLY of the entry
+    # whose session it is about.
+    "session_use_digests",
     "recorded_by",
     "create_intended_at", "create_settled_at", "verified_at",
 )
@@ -887,6 +898,13 @@ PAIR_ENTRY_KEYS = (
 #: SESSION USE is likewise untouched: it is filed per terminal DIGEST in the ``sessions``
 #: section, so a new create attempt cannot overwrite the past use state -- or the refusal
 #: grounds -- of the session it replaces.
+#:
+#: OS-14 BUGFIX (review R1).  ``session_use_digests`` is MONOTONE for the same reason and
+#: is likewise absent from this set: it is an append-only SET of the digests this entry
+#: has written a use row for, so a superseding create attempt ADDS its new session's
+#: digest and keeps the superseded one's.  Clearing it would delete the only proof that
+#: the replaced session's use row is required -- i.e. it would restore, through the retry
+#: path, exactly the "a missing row means unused" reading this cell exists to refuse.
 _PAIR_ENTRY_ATTEMPT_CLEARED = {
     "terminal_digest": "", "refusal_command": "", "refusal_error_code": "",
     "refusal_receipt_digest": "", "create_settled_at": "", "verified_at": "",
@@ -959,6 +977,29 @@ class PairPreparationCorrupt(PauseStoreError):
     authority is not an absent one.  :class:`PauseStoreError` is a ``ValueError`` subclass,
     so catching it cannot swallow control flow.
     """
+
+
+class PairSessionUseRecordLost(PairPreparationCorrupt):
+    """A session-USE row this document's OWN entries claim to have written is GONE.
+
+    OS-14 BUGFIX (review R1).  Its own CLASS, so this module's own contract tests can
+    assert the precise failure, while the adapter's CLOSED refusal-code set deliberately
+    gains no member: a subclass of :class:`PairPreparationCorrupt`, so every caller that
+    already fails closed on an unreadable preparation document fails closed on a lost row
+    too, unchanged, and reports it under the established, locked
+    ``PAIR_PREPARATION_RECORD_CORRUPT`` name -- exactly as review F-001's removed-section
+    refusal does, with WHICH record was lost named by the message below.
+    """
+
+
+def session_use_claims(entry: Mapping[str, Any] | None) -> tuple[str, ...]:
+    """The terminal digests this preparation entry has recorded a session-USE row for.
+
+    ONE parse of ``session_use_digests``, shared by the writer that appends to it and the
+    reader that checks it, so a claim written and a claim read cannot disagree.
+    """
+    raw = (entry or {}).get("session_use_digests") or ""
+    return tuple(part for part in raw.split(",") if part)
 
 
 def pair_binding_path(run_id: str, *,
@@ -1038,6 +1079,17 @@ def validate_pair_entry(entry: Any) -> dict[str, Any]:
         if not value.isdigit() or int(value) < 1:
             raise PairPreparationCorrupt(
                 f"PAIR_PREPARATION_CORRUPT:{key} {value!r} is not a decimal >= 1")
+    # ---- OS-14 BUGFIX (review R1): the use-ledger claim is a comma-joined SET --------
+    # An empty or a repeated segment would make a claim ambiguous, and an ambiguous claim
+    # is as good as an absent one -- which is the single thing this cell exists to make
+    # impossible.  Same whole-or-nothing discipline as every other cell above.
+    claimed = entry["session_use_digests"]
+    if claimed:
+        parts = claimed.split(",")
+        if any(not part for part in parts) or len(set(parts)) != len(parts):
+            raise PairPreparationCorrupt(
+                f"PAIR_PREPARATION_CORRUPT:session_use_digests {claimed!r} is not a "
+                "comma-joined set of non-empty digests")
     return dict(entry)
 
 
@@ -1308,6 +1360,37 @@ class FilePairPreparationStore:
         for digest, row in sections["sessions"].items():
             if validate_pair_session_use(row)["terminal_digest"] != digest:
                 raise PairPreparationCorrupt("PAIR_SESSION_USE_CORRUPT:row identity")
+        # ---- OS-14 BUGFIX (review R1): the use ledger's ROWS are COMPLETE -------------
+        # Review F-001 made the SECTION SET exact.  That is not enough, and the Final
+        # Reviewer proved it: with all three sections present, removing ONE required
+        # per-digest row still made `session_use()` answer `None` for an already-delivered
+        # session, so the validation repair re-delivered to it without the reuse gate ever
+        # being asked.  A section's presence says nothing about its rows.
+        #
+        # `record_session_use` appends the digest to its OWN pair entry in the SAME
+        # `write_json_document` call that writes the row, so "a claim exists and its row
+        # does not" is unreachable for every interleaving of this module's writers --
+        # there is one write, not two, so not even a crash between them exists.  A claimed
+        # row that is gone was therefore REMOVED after the fact, and that is refused BY
+        # NAME here: before any section is interpreted, and so before any session
+        # creation, Task creation, reuse-gate call or delivery.
+        #
+        # What this deliberately does NOT do is turn a genuinely prepared-but-undispatched
+        # session into a refusal: such a session has no row because nothing ever recorded
+        # one, so no entry claims it, so there is nothing missing.  "No row" still means
+        # UNUSED -- but now only when the document itself states that no row was written.
+        for key, slot in sections["pairs"].items():
+            for role, entry in slot.items():
+                for digest in session_use_claims(entry):
+                    if digest not in sections["sessions"]:
+                        raise PairSessionUseRecordLost(
+                            f"PAIR_SESSION_USE_RECORD_LOST:preparation entry {key}/{role} "
+                            f"records that a session-use row was written for digest "
+                            f"{digest} and this document's 'sessions' ledger holds no row "
+                            "for it, so the row has been LOST.  A missing use row is "
+                            "UNKNOWN use, never unused: this run may already have "
+                            "delivered to that session, and nothing here can prove it "
+                            "did not")
         for key, row in sections["role_history"].items():
             validated = validate_pair_role_history(row)
             if role_history_key(validated["phase"], validated["role"]) != key:
@@ -1409,10 +1492,19 @@ class FilePairPreparationStore:
 
         ``None`` means this document holds NO use row for the session.  In a document at
         :data:`PAIR_PREPARATION_SCHEMA_VERSION` that is a POSITIVE statement that the
-        session was never delivered to, because the writer below records
-        ``DELIVERY_INTENDED`` strictly BEFORE the delivery.  It is NOT a statement any
-        OLDER document can make -- which is exactly why the schema version moved: an
-        earlier document is refused as corrupt rather than read as "unused".
+        session was never delivered to, and it rests on TWO invariants, not one:
+
+        * the writer below records ``DELIVERY_INTENDED`` strictly BEFORE the delivery, so
+          a delivery that happened has a row; and
+        * OS-14 BUGFIX (review R1) -- every row the writer creates is CLAIMED, in the same
+          atomic write, by the pair entry it was written for, and ``_read_document``
+          refuses the whole document when a claimed row is gone.  So an absent row is
+          absent BY THE DOCUMENT'S OWN STATEMENT, not merely absent from a section whose
+          rows nothing counts.  A removed row no longer reaches this method at all.
+
+        It is NOT a statement any OLDER document can make -- which is exactly why the
+        schema version moved again: an earlier document is refused as corrupt rather than
+        read as "unused".
         """
         with self._section.locked():
             found = self._read_document()["sessions"].get(terminal_digest)
@@ -1487,6 +1579,31 @@ class FilePairPreparationStore:
                 if stage == "DELIVERED":
                     row["settled_at"] = _iso_now()
                 row = validate_pair_session_use(row)
+            # ---- OS-14 BUGFIX (review R1): the ENTRY's CLAIM, in the SAME write ------
+            # The row and the claim that proves the row exists are published by ONE
+            # `write_json_document` call, so there is no window in which one is durable
+            # and the other is not, and no write ordering to get wrong.
+            #
+            # The entry is REQUIRED, not optional.  In production a use is only ever
+            # recorded for a session THIS run prepared: `OrcaAdapter.start` reaches
+            # `_record_delivery_intent` with a handle only when `_prepare_pair` has
+            # already written the entry for the same (phase, gate_iteration, role), and
+            # the settled half re-uses that same identity.  A row whose entry could not
+            # claim it would be a row whose later loss is undetectable -- which is the
+            # defect, not a tolerated edge.
+            slot_key = pair_key(phase, gate_iteration)
+            entry = sections["pairs"].get(slot_key, {}).get(role)
+            if entry is None:
+                raise PairPreparationCorrupt(
+                    f"PAIR_SESSION_USE_CORRUPT:no preparation entry {slot_key}/{role} to "
+                    "record this session use against; a session use is recorded only for "
+                    "a session this run prepared, and only the entry can hold the claim "
+                    "that makes the row's absence detectable")
+            claimed = session_use_claims(entry)
+            if terminal_digest not in claimed:
+                sections["pairs"][slot_key][role] = validate_pair_entry(
+                    {**entry,
+                     "session_use_digests": ",".join((*claimed, terminal_digest))})
             rows[terminal_digest] = row
             self._write(sections["pairs"], sections)
             return deepcopy(row)
@@ -1508,6 +1625,39 @@ class FilePairPreparationStore:
     def role_histories(self) -> dict[str, dict[str, Any]]:
         with self._section.locked():
             return deepcopy(self._read_document()["role_history"])
+
+    # ---- OS-14 BUGFIX (review R2): the baseline ROW's presence is checkable -----------
+    def role_observations(self, phase: Any, role: str) -> dict[str, str]:
+        """EVERY durable accepted observation of ``(run, phase, role)``, by gate iteration.
+
+        :meth:`role_history` is the run-scoped baseline ROW; an entry's
+        ``resolved_model_observed`` is ONE gate iteration's accepted observation.  This is
+        the set of ALL of the latter for a ``(phase, role)``, across every gate iteration
+        the document holds -- and it is what makes the baseline row's own PRESENCE
+        checkable instead of merely its value.
+
+        Review F-001 made the ``role_history`` SECTION's presence exact; the Final
+        Reviewer proved that is not enough.  At an iteration boundary the CURRENT entry is
+        legitimately absent, so with the one required row removed both of
+        ``_durable_model_baseline``'s legs read empty even though iteration 1's own
+        ``VERIFIED`` entry still proves, on the same disk, that a baseline was
+        established.  An earlier entry's observation is exactly as durable as the row --
+        the writer writes the row FIRST -- so an observation standing with no row behind
+        it is a MISSING REQUIRED RECORD, never "no baseline yet".
+
+        Run-scoped by construction, like every other section: this document lives under
+        this run's own root, so a genuinely NEW run reads an empty mapping here and may
+        resolve the role to a different model.
+        """
+        with self._section.locked():
+            found: dict[str, str] = {}
+            for slot in self._read_document()["pairs"].values():
+                entry = slot.get(role)
+                if entry is None or entry["phase"] != str(phase):
+                    continue
+                if entry["resolved_model_observed"]:
+                    found[entry["gate_iteration"]] = entry["resolved_model_observed"]
+            return found
 
     def record_role_history(self, phase: Any, role: str, resolved_model: str, *,
                             requested_model: str = "",
