@@ -992,6 +992,33 @@ class PairSessionUseRecordLost(PairPreparationCorrupt):
     """
 
 
+class PairPreparationEntryRecordLost(PairPreparationCorrupt):
+    """A preparation ENTRY that this document's OWN surviving records REQUIRE is GONE.
+
+    OS-14 BUGFIX (review B3-E1).  Review R1 checks a pair entry's CLAIM against the
+    ``sessions`` row it names; review B3 checks the launch record's marker against the
+    document holding NO entry AT ALL.  Neither checks the direction this class names: a
+    document that still holds the COUNTERPART role's entry answers ``has_any()`` with
+    ``True``, so the B3 marker gate passes, and the removed role's own ``entry()`` is then
+    ``None`` -- which ``pause_policy.resolve_prepared_terminal`` reads as "nothing was
+    prepared for this role", creating a SECOND session under the same title as a
+    predecessor's still-live one.
+
+    The two records that survive such a removal each PROVE the entry existed, because this
+    module's writers never write either one before the entry (see
+    :meth:`FilePairPreparationStore._read_document`), so their presence with no entry is a
+    MISSING REQUIRED RECORD and never an unprepared role.
+
+    Its own CLASS, so this module's contract tests can assert the precise failure, while
+    the adapter's CLOSED refusal-code set deliberately gains no member: a subclass of
+    :class:`PairPreparationCorrupt`, so every caller that already fails closed on an
+    unreadable preparation document fails closed on a lost entry too, unchanged, and
+    reports it under the established, locked ``PAIR_PREPARATION_RECORD_CORRUPT`` name --
+    exactly as :class:`PairSessionUseRecordLost` and review F-001's removed-section
+    refusal do, with WHICH record was orphaned named by the message.
+    """
+
+
 def session_use_claims(entry: Mapping[str, Any] | None) -> tuple[str, ...]:
     """The terminal digests this preparation entry has recorded a session-USE row for.
 
@@ -1395,6 +1422,90 @@ class FilePairPreparationStore:
             validated = validate_pair_role_history(row)
             if role_history_key(validated["phase"], validated["role"]) != key:
                 raise PairPreparationCorrupt("PAIR_ROLE_HISTORY_CORRUPT:row identity")
+        # ---- OS-14 BUGFIX (review B3-E1): every ROW's own pair ENTRY is still there ---
+        # Review R1 closed the `pairs` -> `sessions` direction: a CLAIM whose row is gone.
+        # These two loops close the REVERSE direction for both record sections -- a ROW
+        # whose ENTRY is gone -- which is what the independent review reproduced: with the
+        # Reviewer entry left in place, `has_any()` was still `True`, so review B3's marker
+        # gate passed; `entry(phase, 1, 'worker')` was then `None`, which
+        # `pause_policy.resolve_prepared_terminal` reads as a FIRST preparation ("the
+        # listing is NOT consulted: there is no title and no digest to resolve"), and the
+        # successor created a second session under the predecessor's own still-live title.
+        #
+        # Both relations rest on this module's and the adapter's WRITER ORDER, not on a
+        # guess about what "should" reference what:
+        #
+        # * a ``sessions`` row is written by `record_session_use` ONLY for a
+        #   (phase, gate_iteration, role) whose entry already exists -- that method refuses
+        #   outright when it cannot find one -- and the row and the entry's CLAIM on it are
+        #   published in ONE `write_json_document` call.  So a row whose entry is gone, or
+        #   whose present entry no longer claims it, had that entry or that claim REMOVED.
+        # * a ``role_history`` row is written by `record_role_history` with
+        #   ``first_gate_iteration`` = the gate iteration the observing pass ran at, and
+        #   the adapter reaches it only AFTER `_prepare_role` published that iteration's
+        #   entry (`CREATE_INTENDED` strictly before the `terminal create`, then
+        #   `CREATED`; an ADOPTED session's entry was already there, since
+        #   `resolve_prepared_terminal` only adopts for a NON-None entry).
+        #   `record_role_history` likewise refuses a row it cannot anchor.  So a row whose
+        #   ``pairs['<phase>#<first_gate_iteration>'][role]`` is gone had that entry
+        #   REMOVED.
+        #
+        # What these deliberately do NOT require, because no writer guarantees it:
+        #
+        # * an entry at the CURRENT gate iteration.  The relation is checked at the ROW's
+        #   OWN ``first_gate_iteration`` / ``gate_iteration``, so a run at iteration N+1
+        #   that has not prepared anything yet is normal and proceeds -- which is exactly
+        #   the iteration boundary review R2 reconciles the baseline across.
+        # * an entry at ``VERIFIED``, or one carrying ``resolved_model_observed``.  The
+        #   baseline row is written BEFORE the entry's `VERIFIED` promotion, deliberately
+        #   (orca_adapter: "History first"), so "row written, observation not yet" is a
+        #   legitimate interrupted state and only the entry's EXISTENCE is required.
+        # * an entry for a role no row names.  A genuine first preparation that has written
+        #   one role and not yet the other has no record of the second, so nothing is
+        #   missing.
+        #
+        # Checked HERE, next to the R1 invariant, because that is where the writer contract
+        # lives: `_write` is this document's only writer and publishes rows and entries
+        # together, so the relation is a property of the DOCUMENT rather than of one code
+        # path. Every read therefore fails closed -- including the `has_any()` inside
+        # `OrcaAdapter._assert_preparation_binding`, which is the adapter's FIRST read and
+        # runs before the first `terminal list`, `terminal create`, adoption,
+        # `verify_model_identity`, `create_task` and dispatch.
+        #
+        # Nothing here regenerates the entry, mints an authority or relaxes a verification:
+        # the only outcome is a named refusal.
+        for digest, row in sections["sessions"].items():
+            slot_key = pair_key(row["phase"], row["gate_iteration"])
+            entry = sections["pairs"].get(slot_key, {}).get(row["role"])
+            if entry is None:
+                raise PairPreparationEntryRecordLost(
+                    "PAIR_PREPARATION_ENTRY_RECORD_LOST:this document holds a session-use "
+                    f"row for digest {digest} filed against preparation entry "
+                    f"{slot_key}/{row['role']}, and that ENTRY IS GONE.  A use row is "
+                    "written only for a session this run prepared, in the same atomic "
+                    "write that makes that entry claim it, so the entry existed and has "
+                    "been LOST -- which is never an unprepared role: the session the row "
+                    "is about may still be live, and nothing here can prove it is not")
+            if digest not in session_use_claims(entry):
+                raise PairPreparationEntryRecordLost(
+                    f"PAIR_PREPARATION_ENTRY_RECORD_LOST:preparation entry "
+                    f"{slot_key}/{row['role']} exists and does not claim it, while this "
+                    f"document holds a session-use row for digest {digest} filed against "
+                    "it.  The row and the claim are published in ONE write, so a claim "
+                    "that is gone was REMOVED -- and an unclaimed row is a row whose own "
+                    "later loss nothing can detect")
+        for key, row in sections["role_history"].items():
+            slot_key = pair_key(row["phase"], row["first_gate_iteration"])
+            if row["role"] not in sections["pairs"].get(slot_key, {}):
+                raise PairPreparationEntryRecordLost(
+                    f"PAIR_PREPARATION_ENTRY_RECORD_LOST:role-history row {key} records "
+                    f"that this run established its {row['role']} baseline at gate "
+                    f"iteration {row['first_gate_iteration']}, and preparation entry "
+                    f"{slot_key}/{row['role']} IS GONE.  The baseline row is written only "
+                    "after that entry has been published, so the entry existed and has "
+                    "been LOST.  A role whose entry is missing is not a role that was "
+                    "never prepared: the session it named may still be live, so no "
+                    "session, Task or Dispatch is created")
         return sections
 
     def _write(self, pairs: dict[str, Any], sections: dict[str, Any] | None = None) -> None:
@@ -1684,6 +1795,18 @@ class FilePairPreparationStore:
                         f"resolved {resolved_model!r}; a role's resolved model is a NEW "
                         "RUN's business, never an overwrite under this run's own name")
                 return deepcopy(existing)        # the FIRST baseline's provenance stands
+            # ---- OS-14 BUGFIX (review B3-E1): the row's ANCHOR, like the use row's ---
+            # The relation is locked at BOTH ends, so this module cannot produce a
+            # document its own reader must then refuse.  The entry is REQUIRED, not
+            # optional: in production the adapter reaches here only after `_prepare_role`
+            # published this very (phase, gate_iteration, role) entry, and only that
+            # entry's presence can make this row's own later loss detectable.
+            slot_key = pair_key(phase, gate_iteration)
+            if role not in sections["pairs"].get(slot_key, {}):
+                raise PairPreparationCorrupt(
+                    f"PAIR_ROLE_HISTORY_CORRUPT:no preparation entry {slot_key}/{role} to "
+                    "anchor this baseline row to; a baseline is established only after the "
+                    "entry whose verification observed it has been published")
             row = new_pair_role_history(
                 run_id=self.run_id, phase=str(phase), role=role,
                 resolved_model=resolved_model, requested_model=requested_model,

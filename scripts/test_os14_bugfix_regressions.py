@@ -1617,6 +1617,14 @@ class PairStoreNewSectionTests(unittest.TestCase):
                          "past use is APPENDED, never overwritten")
 
     def test_history_is_write_once_per_role_and_refuses_a_change(self) -> None:
+        # OS-14 BUGFIX (review B3-E1): a baseline row is ANCHORED to the preparation entry
+        # whose verification observed it, in the same way review R1 made a use row's entry
+        # a precondition above -- the production path always has one (the adapter reaches
+        # `record_role_history` only after `_prepare_role` published that iteration's
+        # entry), so this unit test now STATES that precondition instead of relying on the
+        # writer not checking it.  What it asserts -- write-once, and a change refused --
+        # is unchanged.
+        self.prepare_entry()
         self.store.record_role_history(PHASE, "worker", "glm-5.2")
         self.assertEqual(self.store.role_history(PHASE, "worker")["resolved_model"],
                          "glm-5.2")
@@ -1627,6 +1635,7 @@ class PairStoreNewSectionTests(unittest.TestCase):
                          "glm-5.2")
 
     def test_history_is_scoped_to_the_phase_and_the_role(self) -> None:
+        self.prepare_entry()                       # the row's anchor; see above
         self.store.record_role_history(PHASE, "worker", "glm-5.2")
         self.assertIsNone(self.store.role_history(PHASE, "reviewer"))
         self.assertIsNone(self.store.role_history("other", "worker"))
@@ -1650,6 +1659,465 @@ class PairStoreNewSectionTests(unittest.TestCase):
                                     "pairs": {}}), encoding="utf-8")
         with self.assertRaises(pause_store.PairPreparationCorrupt):
             self.store.has_any()
+
+
+# ======================================================================================
+# B3-E1  a preparation ENTRY that a SURVIVING record still requires is never an
+#        un-prepared role
+# ======================================================================================
+def strip_pair_entry(path: Path, phase, gate_iteration, role: str) -> dict:
+    """Remove exactly ONE ``pairs[<phase>#<gate_iteration>][<role>]`` entry on disk.
+
+    The whole fixture, and deliberately the SMALLEST possible one: the slot itself stays
+    (the counterpart role's entry is still in it), the ``sessions`` and ``role_history``
+    sections stay with every row intact, the schema version stays, and the launch binding
+    -- a different file -- is not touched at all.  What is left is exactly the state the
+    independent review reproduced: a document whose ``has_any()`` is still ``True`` and
+    whose ``entry(phase, iteration, role)`` is ``None``.
+    """
+    document = json.loads(path.read_text(encoding="utf-8"))
+    key = pause_store.pair_key(phase, gate_iteration)
+    slot = document["pairs"].get(key, {})
+    if role not in slot:
+        raise AssertionError(
+            f"{key}/{role} was not there to remove: "
+            f"{ {slot_key: sorted(value) for slot_key, value in document['pairs'].items()} }")
+    slot.pop(role)
+    path.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+    return document
+
+
+@REQUIRES_LANGGRAPH
+class B3E1LostPreparationEntryTests(_CorrectionChildRoom):
+    """(B3-E1) Prepare and verify BOTH roles, stop before ``create_task``, remove ONLY
+    ``pairs['<phase>#1']['worker']``, then re-enter the same intent from a REAL successor
+    process.
+
+    The independent review's reproduction on `2829f42`: the Reviewer entry survived, so
+    `_assert_preparation_not_lost`'s ``store.has_any()`` was ``True`` and the B3 marker
+    gate passed; the Worker's own ``entry`` was then ``None``, which
+    `pause_policy.resolve_prepared_terminal` reads as a FIRST preparation, so the
+    successor CREATED a second ``<run_id>-pair-<phase>-1-worker`` beside the
+    predecessor's still-live one and ran the phase to ``COMPLETED``.
+
+    This is a duplicate-SESSION reproduction, not a duplicate execution of an
+    already-created Task: the predecessor died at the admission boundary and issued no
+    ``task-create`` at all.  And every green assertion here is evidence about the WIRING
+    of the real launcher/executor/adapter path over reference driver and runtime doubles
+    -- never about any real Claude or Orca model.
+    """
+
+    def _document(self) -> dict:
+        path = pause_store.pair_preparation_path(RUN_ID, artifact_base=self.project)
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def successor_over_the_lost_entry(self, *, role="worker"):
+        launch = self.predecessor_at_admission()
+        path = pause_store.pair_preparation_path(RUN_ID, artifact_base=self.project)
+        counterpart = "reviewer" if role == "worker" else "worker"
+        before = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(before["sessions"], {},
+                         "nothing was delivered, so there is no use row in this subcase")
+        remaining = strip_pair_entry(path, PHASE, 1, role)
+        self.assertEqual(sorted(remaining),
+                         ["pairs", "role_history", "schema_version", "sessions"],
+                         "ONLY one entry was removed; every section is still there")
+        self.assertIn(counterpart, remaining["pairs"][f"{PHASE}#1"],
+                      "the counterpart role's entry is KEPT -- that is the whole defect")
+        self.assertEqual(
+            sorted(remaining["role_history"]),
+            sorted(pause_store.role_history_key(PHASE, each)
+                   for each in ("worker", "reviewer")),
+            "BOTH role_history rows are kept, including the removed role's own")
+        self.assertEqual(
+            remaining["role_history"][pause_store.role_history_key(PHASE, role)][
+                "first_gate_iteration"], "1",
+            "the surviving row names gate iteration 1 as where the entry was written")
+        self.assertTrue(
+            pause_store.pair_binding_path(RUN_ID, artifact_base=self.project).is_file(),
+            "the launch binding is KEPT")
+        self.assertEqual(len(launch.recorder.created_pairs), 2,
+                         "both external fake sessions are left in the listing")
+        report = self.successor(launch, resume="fresh", driver_class="reference")
+        return launch, report
+
+    def test_the_lost_worker_entry_blocks_the_successor_by_name(self) -> None:
+        """B3-E1, the defect itself.
+
+        Measured on `2829f42` (the review-basis SHA): one ADDITIONAL Worker session,
+        three ``task-create``s, three dispatches and ``COMPLETED``.
+        """
+        _launch, report = self.successor_over_the_lost_entry()
+        reason = report["terminal_reason"] or {}
+        self.assertEqual(report["terminal_status"], "BLOCKED",
+                         f"status={report['terminal_status']} reason={reason} "
+                         f"execute_error={report['execute_error']}")
+        self.assertEqual(reason.get("code"), "PAIR_PREPARATION_RECORD_CORRUPT",
+                         f"the refusal must NAME the lost entry; got {reason}")
+
+    def test_the_lost_worker_entry_creates_no_session_task_or_dispatch(self) -> None:
+        """The refusal lands on the successor's FIRST read of the document, which is
+        inside `_assert_preparation_binding` -- before the first `terminal list`, the
+        first `terminal create`, the first adoption, `create_task` and any dispatch."""
+        _launch, report = self.successor_over_the_lost_entry()
+        self.assertEqual(report["pair_creates"], 0, "NO additional session was created")
+        self.assertEqual(report["task_creates"], 0, "NO Task was created")
+        self.assertEqual(report["worker_starts"], 0, "NOTHING was dispatched")
+        self.assertEqual(report["child_deliveries"], [])
+        self.assertEqual(report["sends"], 0)
+
+    def test_the_successor_really_is_a_separate_process_that_RESUMED(self) -> None:
+        """The re-entry is the executor's own `CLAIMED -> RESUMED -> lookup` path in a
+        REAL separate OS process, not a fresh workflow over an empty ledger.
+
+        (`successor()` itself asserts ``pid != os.getpid()``.)
+        """
+        _launch, report = self.successor_over_the_lost_entry()
+        self.assertTrue(report["claim_log"], "the successor claimed at least once")
+        self.assertEqual(report["claim_log"][0][1], "RESUMED",
+                         f"the FIRST claim took over the predecessor's own CLAIMED "
+                         f"record: {report['claim_log']}")
+
+    def test_nothing_is_regenerated_and_the_live_sessions_are_untouched(self) -> None:
+        """A refusal never heals the document and never mints the authority it is missing:
+        the entry stays gone, the surviving records stay exactly as they were, and the two
+        sessions the predecessor really created are neither re-created nor adopted."""
+        launch, report = self.successor_over_the_lost_entry()
+        # "Untouched" read off the SUCCESSOR's own recorder, which is the only thing that
+        # could have touched them: it created no session, adopted and delivered to none,
+        # and sent nothing.  (`launch.recorder` below is the PREDECESSOR's record of what
+        # IT created and is asserted only to show that record still names two sessions.)
+        self.assertEqual([report["pair_creates"], report["worker_starts"],
+                          report["sends"]], [0, 0, 0])
+        self.assertEqual(report["child_deliveries"], [])
+        document = self._document()
+        self.assertNotIn("worker", document["pairs"][f"{PHASE}#1"],
+                         "the missing entry was REGENERATED, which is the defect itself")
+        self.assertIn("reviewer", document["pairs"][f"{PHASE}#1"],
+                      "the counterpart entry is preserved, not cleaned up")
+        self.assertIn(pause_store.role_history_key(PHASE, "worker"),
+                      document["role_history"],
+                      "the surviving row -- the proof the entry was required -- is kept")
+        self.assertNotIn(f"{PHASE}#2", document["pairs"],
+                         "no later iteration was prepared behind the refusal")
+        self.assertEqual(len(launch.recorder.created_pairs), 2,
+                         "the predecessor's record still names the two sessions it created")
+        # And the NEXT reader fails closed for the same reason, so the refusal is a
+        # property of the document rather than of one process's luck.
+        with self.assertRaises(pause_store.PairPreparationCorrupt):
+            launch.adapter.pair_preparation.has_any()
+
+    def test_the_reviewers_own_lost_entry_is_refused_the_same_way(self) -> None:
+        """The relation is about the RECORD, not about which role it names: the Reviewer's
+        surviving ``role_history`` row proves the Reviewer entry existed too."""
+        _launch, report = self.successor_over_the_lost_entry(role="reviewer")
+        reason = report["terminal_reason"] or {}
+        self.assertEqual(report["terminal_status"], "BLOCKED",
+                         f"status={report['terminal_status']} reason={reason} "
+                         f"execute_error={report['execute_error']}")
+        self.assertEqual(reason.get("code"), "PAIR_PREPARATION_RECORD_CORRUPT", reason)
+        self.assertEqual(report["pair_creates"], 0)
+        self.assertEqual(report["task_creates"], 0)
+        self.assertEqual(report["worker_starts"], 0)
+
+    def test_a_genuine_first_preparation_still_proceeds(self) -> None:
+        """POSITIVE CONTROL: with nothing ever prepared there is no record to require an
+        entry, so the normal Worker -> Reviewer round prepares and completes."""
+        launch = self.launch()
+        final = self.execute(launch)
+        self.assertEqual(final.get("terminal_status"), "COMPLETED",
+                         final.get("terminal_reason"))
+        self.assertEqual(len(launch.recorder.pair_titles), 2)
+        self.assertEqual(len(deliveries(launch.recorder)), 3,
+                         "Worker, phase Reviewer and Final Reviewer were all dispatched")
+
+    def test_a_prior_baseline_with_the_next_iteration_unprepared_still_proceeds(self):
+        """POSITIVE CONTROL, and the over-refusal this fix must NOT commit: at an
+        iteration boundary both ``role_history`` rows stand with
+        ``first_gate_iteration == '1'`` and NOTHING is prepared for iteration 2 yet.
+
+        Iteration 1's entries are still there, so every surviving row's own entry is
+        present and the CURRENT iteration is required to have nothing.  A real successor
+        process prepares iteration 2 normally.
+        """
+        launch = self.predecessor_at_iteration_boundary()
+        document = self._document()
+        self.assertNotIn(f"{PHASE}#2", document["pairs"],
+                         "iteration 2 has NO entry, which is this control's premise")
+        self.assertEqual(sorted(document["role_history"]),
+                         sorted(pause_store.role_history_key(PHASE, role)
+                                for role in ("worker", "reviewer")),
+                         "both iteration-1 baselines stand")
+        report = self.successor(launch, drift={})
+        reason = report["terminal_reason"] or {}
+        self.assertNotEqual(
+            reason.get("code"), "PAIR_PREPARATION_RECORD_CORRUPT",
+            f"a not-yet-prepared NEXT iteration was treated as a lost entry: {reason}")
+        self.assertEqual(report["pair_creates"], 2,
+                         f"iteration 2 prepared its own pair: {report['pair_titles']}")
+
+
+@REQUIRES_LANGGRAPH
+class B3E1LostEntryBehindAUseRowTests(PairRoom):
+    """(B3-E1, the use-row leg) The entry that CLAIMED a session-use row is removed.
+
+    The R1 invariant checks the claim -> row direction: a claim whose row is gone.  This
+    is the OTHER direction, and on `2829f42` nothing checked it: removing the ENTRY takes
+    its ``session_use_digests`` claim with it, so the surviving row was claimed by nobody
+    and R1 had nothing left to miss -- while `session_use()` still answered the row for
+    the digest, and the role whose entry was gone read as a FIRST preparation.
+    """
+
+    def run_with_the_entry_removed_before_the_repair(self):
+        launch = self.launch(bodies=repair_bodies())
+        path = pause_store.pair_preparation_path(RUN_ID, artifact_base=self.project)
+        production_start = launch.adapter.start
+        seen = {"starts": 0, "removed": False}
+
+        def start_with_the_entry_removed(intent, **kwargs):
+            seen["starts"] += 1
+            if seen["starts"] == 2:               # the validation repair's own start
+                used = deliveries(launch.recorder)[0]
+                digest = pause_store.terminal_use_digest(used)
+                document = json.loads(path.read_text(encoding="utf-8"))
+                self.assertIn(digest, document["sessions"],
+                              "the first delivery really wrote a use row")
+                self.assertEqual(document["sessions"][digest]["role"], "worker")
+                remaining = strip_pair_entry(path, PHASE, 1, "worker")
+                self.assertIn(digest, remaining["sessions"],
+                              "ONLY the entry was removed; the use ROW stays")
+                self.assertIn("reviewer", remaining["pairs"][f"{PHASE}#1"],
+                              "the counterpart entry stays")
+                seen["removed"] = True
+            return production_start(intent, **kwargs)
+
+        launch.adapter.start = start_with_the_entry_removed
+        final = self.execute(launch)
+        launch.adapter.start = production_start
+        self.assertTrue(seen["removed"],
+                        "the repair's start was reached and the entry was removed")
+        return launch, final
+
+    def test_the_lost_entry_blocks_the_repair_by_name(self) -> None:
+        _launch, final = self.run_with_the_entry_removed_before_the_repair()
+        self.assertEqual(final.get("terminal_status"), "BLOCKED",
+                         final.get("terminal_reason"))
+        self.assertEqual((final.get("terminal_reason") or {}).get("code"),
+                         "PAIR_PREPARATION_RECORD_CORRUPT",
+                         f"reason={final.get('terminal_reason')}")
+
+    def test_the_used_session_receives_no_second_delivery_and_nothing_is_created(self):
+        launch, _final = self.run_with_the_entry_removed_before_the_repair()
+        sent = deliveries(launch.recorder)
+        self.assertEqual(len(sent), 1,
+                         f"the repair was delivered over a lost entry: {sent}")
+        decision = launch.harness.last_reuse_decision
+        self.assertFalse(
+            decision is not None and decision["eligible"] is True,
+            f"a lost entry produced an ELIGIBLE reuse verdict: {decision}")
+        pair_creates = [command for command in launch.recorder.commands
+                        if command[:2] == ("terminal", "create")
+                        and any(f"{RUN_ID}-pair-" in part for part in command)]
+        self.assertEqual(len(pair_creates), 2, pair_creates)
+        self.assertEqual(sum(1 for c in launch.recorder.commands
+                             if c[1:2] == ("task-create",)), 1,
+                         "only the first, intact round's Task exists")
+        self.assertEqual(launch.recorder.count("terminal", "send"), 0)
+
+
+class B3E1EntryReferenceTests(unittest.TestCase):
+    """(B3-E1) The reader's own entry-reference contract, directly on the store.
+
+    The two RELATIONS, exactly as the production writers guarantee them:
+
+    * a ``role_history`` row for ``(phase, role)`` with ``first_gate_iteration == N``
+      REQUIRES ``pairs['<phase>#N'][role]`` to exist -- the adapter writes the row only
+      after that entry has been published (``orca_adapter._prepare_role`` writes
+      ``CREATE_INTENDED``/``CREATED``; the verification loop then calls
+      ``record_role_history``), and ``record_role_history`` refuses a row it cannot anchor.
+    * a ``sessions`` row for ``(phase, gate_iteration, role, digest)`` REQUIRES
+      ``pairs['<phase>#<gate_iteration>'][role]`` to exist AND to CLAIM that digest --
+      ``record_session_use`` publishes the row and the claim in ONE atomic write and
+      refuses a row with no entry to claim it.
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.root = Path(self.temporary_directory.name)
+        self.store = pause_store.pair_preparation_for(RUN_ID, artifact_base=self.root)
+        self.path = pause_store.pair_preparation_path(RUN_ID, artifact_base=self.root)
+
+    def prepare_entry(self, *, role="worker", gate_iteration=1, stage="VERIFIED",
+                      digest="d1", observed="glm-5.2"):
+        return self.store.record(
+            PHASE, gate_iteration, role, stage=stage, terminal_title="t",
+            terminal_worktree="w", terminal_digest=digest,
+            **({"resolved_model_observed": observed} if observed else {}))
+
+    # ---- the HISTORY-row relation ----------------------------------------------------
+    def test_a_history_row_whose_own_entry_is_gone_is_refused_by_name(self) -> None:
+        self.prepare_entry()
+        self.store.record_role_history(PHASE, "worker", "glm-5.2", gate_iteration=1)
+        strip_pair_entry(self.path, PHASE, 1, "worker")
+        with self.assertRaises(pause_store.PairPreparationCorrupt) as caught:
+            self.store.role_history(PHASE, "worker")
+        message = str(caught.exception)
+        self.assertIn("PAIR_PREPARATION_ENTRY_RECORD_LOST", message)
+        self.assertIn(f"{PHASE}#1", message)
+        self.assertIn("worker", message)
+
+    def test_the_history_relation_is_checked_at_the_rows_OWN_iteration(self) -> None:
+        """The row names WHERE its entry is, so removing a LATER iteration's entry -- which
+        no row requires -- is not a loss, while removing the row's OWN anchor is.  The two
+        are never confused for each other."""
+        self.prepare_entry(gate_iteration=1)
+        self.store.record_role_history(PHASE, "worker", "glm-5.2", gate_iteration=1)
+        self.prepare_entry(gate_iteration=2, digest="d2")
+        self.assertEqual(sorted(self.store.role_observations(PHASE, "worker")),
+                         ["1", "2"])
+        # Removing iteration 2's entry removes an observation, NOT the row's anchor.
+        strip_pair_entry(self.path, PHASE, 2, "worker")
+        self.assertEqual(self.store.role_observations(PHASE, "worker"), {"1": "glm-5.2"},
+                         "iteration 1 is still the row's anchor and still readable")
+        # Removing iteration 1's entry removes the ANCHOR, and that is the refusal.
+        strip_pair_entry(self.path, PHASE, 1, "worker")
+        with self.assertRaises(pause_store.PairPreparationCorrupt):
+            self.store.role_observations(PHASE, "worker")
+
+    def test_a_history_row_written_before_the_entry_is_VERIFIED_is_not_a_loss(self):
+        """POSITIVE CONTROL, and the legitimate intermediate state this must preserve: the
+        writer writes the row FIRST, so a process that died between
+        ``record_role_history`` and the entry's ``VERIFIED`` promotion leaves a row whose
+        entry stands at ``CREATED`` with NO ``resolved_model_observed`` at all."""
+        self.prepare_entry(stage="CREATED", observed="")
+        self.store.record_role_history(PHASE, "worker", "glm-5.2", gate_iteration=1)
+        entry = self.store.entry(PHASE, 1, "worker")
+        self.assertEqual(entry["stage"], "CREATED")
+        self.assertEqual(entry["resolved_model_observed"], "",
+                         "this is the 'history written, VERIFIED not yet' state")
+        self.assertEqual(self.store.role_history(PHASE, "worker")["resolved_model"],
+                         "glm-5.2", "and the document still reads")
+        self.assertEqual(self.store.role_observations(PHASE, "worker"), {})
+        self.assertTrue(self.store.has_any())
+
+    def test_a_later_iteration_with_no_entry_yet_is_not_a_loss(self) -> None:
+        """POSITIVE CONTROL: the row's ``first_gate_iteration`` is 1 and the run is at
+        iteration 2 with nothing prepared.  Required: iteration 1's entry.  NOT required:
+        iteration 2's."""
+        self.prepare_entry(gate_iteration=1)
+        self.store.record_role_history(PHASE, "worker", "glm-5.2", gate_iteration=1)
+        self.assertIsNone(self.store.entry(PHASE, 2, "worker"))
+        self.assertTrue(self.store.has_any())
+        self.assertEqual(self.store.role_history(PHASE, "worker")["first_gate_iteration"],
+                         "1")
+
+    def test_a_second_role_that_was_never_prepared_is_not_a_loss(self) -> None:
+        """POSITIVE CONTROL: a genuine first preparation that has written the Worker and
+        not yet the Reviewer.  No row names the Reviewer, so nothing is missing."""
+        self.prepare_entry(role="worker")
+        self.store.record_role_history(PHASE, "worker", "glm-5.2", gate_iteration=1)
+        self.assertIsNone(self.store.entry(PHASE, 1, "reviewer"))
+        self.assertIsNone(self.store.role_history(PHASE, "reviewer"))
+        self.assertTrue(self.store.has_any())
+
+    def test_the_writer_refuses_a_history_row_it_cannot_anchor(self) -> None:
+        """The relation is locked at BOTH ends, like the use row's: a row that no entry
+        anchors is refused at the WRITE, so this module cannot produce a document that its
+        own reader must then refuse."""
+        with self.assertRaises(pause_store.PairPreparationCorrupt) as caught:
+            self.store.record_role_history(PHASE, "worker", "glm-5.2", gate_iteration=1)
+        self.assertIn("no preparation entry", str(caught.exception))
+        self.assertEqual(self.store.role_histories(), {}, "no row was written either")
+
+    # ---- the USE-row relation --------------------------------------------------------
+    def record_a_use(self, digest="d1", role="worker", gate_iteration=1):
+        self.prepare_entry(role=role, gate_iteration=gate_iteration, digest=digest,
+                           observed="")
+        return self.store.record_session_use(
+            digest, stage="DELIVERED", phase=PHASE, gate_iteration=gate_iteration,
+            role=role, intent_id="i1", dispatch_id="ctx_1")
+
+    def test_a_use_row_whose_own_entry_is_gone_is_refused_by_name(self) -> None:
+        self.record_a_use()
+        strip_pair_entry(self.path, PHASE, 1, "worker")
+        with self.assertRaises(pause_store.PairPreparationCorrupt) as caught:
+            self.store.session_use("d1")
+        message = str(caught.exception)
+        self.assertIn("PAIR_PREPARATION_ENTRY_RECORD_LOST", message)
+        self.assertIn("d1", message)
+
+    def test_removing_the_entry_cannot_launder_a_lost_use_row(self) -> None:
+        """Removing the entry removes the CLAIM with it, so the R1 claim -> row check has
+        nothing left to miss.  The row -> entry check is what catches it, and removing
+        BOTH the entry and the row it required is the documented residual, not this."""
+        self.record_a_use()
+        document = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(document["pairs"][f"{PHASE}#1"]["worker"]["session_use_digests"],
+                         "d1")
+        strip_pair_entry(self.path, PHASE, 1, "worker")
+        document = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertNotIn("d1", json.dumps(document["pairs"]),
+                         "no claim survives, so R1 alone would read the document as sound")
+        with self.assertRaises(pause_store.PairPreparationCorrupt):
+            self.store.has_any()
+
+    def test_a_use_row_its_entry_no_longer_claims_is_refused(self) -> None:
+        """The relation is row -> entry AND claim: an entry that is still there but has
+        been edited to drop the claim leaves the row's loss undetectable again."""
+        self.record_a_use()
+        document = json.loads(self.path.read_text(encoding="utf-8"))
+        document["pairs"][f"{PHASE}#1"]["worker"]["session_use_digests"] = ""
+        self.path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaises(pause_store.PairPreparationCorrupt) as caught:
+            self.store.sessions()
+        self.assertIn("does not claim it", str(caught.exception))
+
+    def test_a_use_row_filed_against_another_iterations_entry_is_refused(self) -> None:
+        """The row names WHICH boundary used the session, so its entry is looked up at
+        that boundary and not merely anywhere in the document."""
+        self.record_a_use(gate_iteration=1)
+        document = json.loads(self.path.read_text(encoding="utf-8"))
+        document["sessions"]["d1"]["gate_iteration"] = "2"
+        self.path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaises(pause_store.PairPreparationCorrupt):
+            self.store.has_any()
+
+    # ---- the shape of the refusal ----------------------------------------------------
+    def test_every_read_of_the_document_fails_closed(self) -> None:
+        """Which is why `OrcaAdapter.start` refuses at its FIRST store read -- inside
+        `_assert_preparation_binding`, before any session, Task or dispatch."""
+        self.record_a_use()
+        self.store.record_role_history(PHASE, "worker", "glm-5.2", gate_iteration=1)
+        strip_pair_entry(self.path, PHASE, 1, "worker")
+        for read in (self.store.has_any, self.store.sessions, self.store.pairs,
+                     self.store.role_histories,
+                     lambda: self.store.entry(PHASE, 1, "worker"),
+                     lambda: self.store.entry(PHASE, 1, "reviewer"),
+                     lambda: self.store.session_use("d1"),
+                     lambda: self.store.role_history(PHASE, "worker"),
+                     lambda: self.store.role_observations(PHASE, "worker")):
+            with self.assertRaises(pause_store.PairPreparationCorrupt):
+                read()
+
+    def test_the_lost_class_is_a_corrupt_subclass_so_old_callers_fail_closed(self) -> None:
+        self.assertTrue(issubclass(pause_store.PairPreparationEntryRecordLost,
+                                   pause_store.PairPreparationCorrupt))
+        self.assertNotIn("PAIR_PREPARATION_ENTRY_RECORD_LOST",
+                         PAIR_PREPARATION_REFUSAL_CODES,
+                         "the closed refusal set deliberately gained no member")
+
+    def test_an_intact_document_with_both_records_still_reads(self) -> None:
+        """POSITIVE CONTROL for the whole class: both relations hold, so every read
+        answers normally."""
+        self.record_a_use()
+        self.store.record_role_history(PHASE, "worker", "glm-5.2", gate_iteration=1)
+        self.assertTrue(self.store.has_any())
+        self.assertEqual(self.store.session_use("d1")["stage"], "DELIVERED")
+        self.assertEqual(self.store.role_history(PHASE, "worker")["resolved_model"],
+                         "glm-5.2")
+        self.assertEqual(sorted(self.store.pairs()[f"{PHASE}#1"]), ["worker"])
 
 
 if __name__ == "__main__":                                   # pragma: no cover

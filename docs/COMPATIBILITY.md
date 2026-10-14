@@ -914,8 +914,17 @@ supposed to be checked against.
 
 **One documented conservative case.** A process that died between the marker write and the
 first `CREATE_INTENDED` produced no external effect and is still refused, because this gate
-reads the marker rather than guessing at that two-write window. The remedy is the operator
-procedure below — never an unconditional relaunch.
+reads the marker rather than guessing at that two-write window. The same conservative
+`BLOCKED` covers a *failed* first entry write: the marker is set and the first
+`CREATE_INTENDED` then cannot be written at all (a lock timeout, a full or read-only
+volume, an I/O error). Because the order is *marker → `CREATE_INTENDED` → `terminal
+create`*, a `CREATE_INTENDED` that was never written means the `terminal create` it
+precedes was never issued, so **no session, Task or Dispatch exists** — and a later
+re-entry meets "marker present, no entry at all" and refuses with
+`PAIR_PREPARATION_RECORD_LOST`. The refusal is conservative in exactly that documented
+way: it reports a possible loss where there was provably no external effect, rather than
+guessing at the window. The safe write order is **not** changed to make the wording
+narrower. The remedy is the operator procedure below — never an unconditional relaunch.
 
 **The write ordering, exactly.** `_assert_preparation_not_lost()` runs before either role
 is prepared and, when no entry exists, writes the marker there — and refuses with
@@ -926,19 +935,68 @@ state this writer cannot produce. (An earlier revision of this section described
 "between the first entry write and the marker write" as a residual window; that ordering
 does not exist and the claim is withdrawn.)
 
-**The real remaining window, stated rather than hidden.** The marker's question is "was
-*any* entry ever written for this run", so it detects the loss of the **whole** document.
-It does not detect a document that is still present and still holds entries but has lost
-**some** of them: for a `(phase, gate_iteration, role)` whose entry is gone while another
-role's entry remains, `pause_policy.resolve_prepared_terminal(None, ...)` returns `create`
-without consulting the listing, and a new session is prepared under the same title as the
-predecessor's still-live one. This was reproduced directly (removing only the worker entry
-of an intact, admission-stage document; the re-entry created a second
-`<run_id>-pair-<phase>-1-worker` and the run completed). Two guards do apply and neither
-closes it: a lost launch record is refused (`PAIR_PREPARATION_BINDING_LOST`), and a
-**section**-level truncation of the same document is refused as
-`PAIR_PREPARATION_RECORD_CORRUPT` because a present document's top-level section set is
-exact. Entry-level granularity is not addressed by this change; treat a partially
+### Entry-level preparation loss (B3-E1): a record's own entry must still be there
+
+The marker above answers "was *any* entry ever written for this run", so it detects the
+loss of the **whole** document. On its own it did not detect a document that is still
+present and still holds entries but has lost **some** of them: with another role's entry
+remaining, `store.has_any()` was `True`, the marker gate passed, the removed role's own
+`entry()` was `None`, and `pause_policy.resolve_prepared_terminal(None, ...)` returns
+`create` without consulting the listing — so a new session was prepared under the same
+title as the predecessor's still-live one. Reproduced directly on the review-basis SHA by
+removing only the worker entry of an intact, admission-stage document: the re-entry from a
+real successor process created a second `<run_id>-pair-<phase>-1-worker`, then issued three
+`task-create`s and three dispatches and the run reached `COMPLETED`. **That reproduction is
+no longer an accepted residual.**
+
+**What is now detected and refused by name.** Two record→entry relations are checked in
+`FilePairPreparationStore._read_document()`, beside the review R1 claim→row invariant, and
+each is grounded in the writer order that produces it:
+
+| Surviving record | Entry it requires | Why the writer guarantees it |
+| --- | --- | --- |
+| a `role_history` row for `(phase, role)` with `first_gate_iteration` = *N* | `pairs['<phase>#N'][role]` **exists** | `record_role_history` is reached only after `_prepare_role` published that iteration's entry (`CREATE_INTENDED` strictly before the `terminal create`, then `CREATED`; an adopted session's entry was already there), and the writer now refuses a row it cannot anchor |
+| a `sessions` row for `(phase, gate_iteration, role, digest)` | `pairs['<phase>#<gate_iteration>'][role]` **exists and claims that digest** in `session_use_digests` | `record_session_use` refuses a row with no entry to claim it and publishes the row and the claim in **one** atomic write |
+
+A violation raises `PairPreparationEntryRecordLost` — a `PairPreparationCorrupt` subclass,
+so the adapter's closed refusal-code set gains no member and the run stops as
+`PAIR_PREPARATION_RECORD_CORRUPT`, with the message naming which record was orphaned.
+Because the checks live in the document reader, **every** read fails closed, including the
+`has_any()` inside `OrcaAdapter._assert_preparation_binding` — the adapter's first store
+read, which runs before the first `terminal list`, the first `terminal create`, any
+adoption, any `verify_model_identity`, `create_task` and any dispatch. Nothing is
+regenerated, no authority is minted, no verification is relaxed and no session is adopted
+on a title match.
+
+**The legitimate states this deliberately does not refuse.** Each relation is checked at
+the *row's own* iteration, never at the current one:
+
+- the current gate iteration having **no** entry yet while an earlier iteration's baseline
+  row stands — the ordinary iteration boundary review R2 reconciles across;
+- an entry at `CREATED`, or without `resolved_model_observed`, while its baseline row
+  exists — the baseline is written *first*, deliberately, so "history written, `VERIFIED`
+  not yet" is a legitimate interrupted state and only the entry's **existence** is
+  required;
+- a second role not prepared yet on a genuine first preparation — no record names it, so
+  nothing is missing;
+- a prepared-but-undispatched session with no use row — nothing claims it, so nothing is
+  missing (review R1's own discrimination, unchanged).
+
+**What is still not guaranteed.** This is a reference check over the records the document
+itself holds, not a tamper-detection scheme, and it is not meant to become one:
+
+- an entry removed together with **every** record that referenced it — for example an
+  entry deleted before its first delivery and before its baseline row was written, or an
+  entry and its own rows removed in one edit. Nothing then survives to prove the entry
+  existed, and the whole-document marker only answers the "any entry at all" question.
+- arbitrary concurrent edits by a writer outside this module, which can produce states no
+  order of this module's writes can.
+- a **rollback** of the whole file to an earlier version: every surviving record is then
+  consistent with the entries that remain, so no relation is violated.
+
+A lost launch record is still refused (`PAIR_PREPARATION_BINDING_LOST`), and a
+**section**-level truncation is still refused as `PAIR_PREPARATION_RECORD_CORRUPT` because
+a present document's top-level section set is exact. For the cases above, treat a partially
 hand-edited or partially restored preparation document as unsafe and follow the operator
 procedure below rather than re-entering the run.
 
