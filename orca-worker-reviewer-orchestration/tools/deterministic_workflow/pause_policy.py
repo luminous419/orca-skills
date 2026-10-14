@@ -470,6 +470,107 @@ def resolve_terminal_handle(row: Mapping[str, Any], listing: Any, *,
             "corroborated_absent": bool(corroborated_absent)}
 
 
+# ---- OS-14: the prepared-session decision table --------------------------------------
+#: A blocking enumeration outcome -> the adapter refusal code that names it.  No member is
+#: added to :data:`HANDLE_RECOVERY_OUTCOMES`: that set has no name for "the listing could
+#: not be read", so an unreadable listing is reported as ``scope_unresolved`` and refused
+#: as ``PAIR_PREPARATION_SCOPE_UNRESOLVED`` -- read as "the scope could not be
+#: ESTABLISHED".  The adapter maps its own read failure to the identical code, so the first
+#: attempt and every re-entry return the same name.
+_PREPARED_BLOCK_CODES = {
+    "listing_candidate": "PAIR_PREPARATION_SESSION_UNVERIFIED",  # title matched, digest did not
+    "unverified": "PAIR_PREPARATION_SESSION_UNVERIFIED",
+    "not_listed": "PAIR_PREPARATION_SESSION_ABSENT",             # provably gone
+    "scope_unresolved": "PAIR_PREPARATION_SCOPE_UNRESOLVED",
+}
+
+
+def _resolve_prepared_listing(entry: Mapping[str, Any], listing: Any, *,
+                              scope_resolved: bool) -> dict[str, Any]:
+    """Title narrows, digest decides -- :func:`resolve_terminal_handle`'s own rule, applied
+    to an OS-14 preparation entry.  An UNREADABLE listing is unknown, never empty.
+    """
+    if listing is None:
+        return {"handle": None, "handle_recovery": "scope_unresolved",
+                "candidate_handle": ""}
+    target = entry.get("terminal_title") or ""
+    candidates = [element for element in listing
+                  if isinstance(element, Mapping)
+                  and match_terminal_title(element.get("title"), target)]
+    digest = entry.get("terminal_digest") or ""
+    if not digest:
+        # A prepared entry at CREATED/VERIFIED always has one, so this is reachable only
+        # from CREATE_INTENDED, whose verdict the caller has already fixed.
+        if candidates:
+            handle = candidates[0].get("handle")
+            return {"handle": None, "handle_recovery": "listing_candidate",
+                    "candidate_handle": handle if isinstance(handle, str) else ""}
+        return {"handle": None,
+                "handle_recovery": "not_listed" if scope_resolved else "scope_unresolved",
+                "candidate_handle": ""}
+    verified = [element for element in candidates
+                if isinstance(element.get("handle"), str)
+                and terminal_digest(element["handle"]) == digest]
+    if len(verified) == 1:
+        return {"handle": verified[0]["handle"],
+                "handle_recovery": "listing_verified", "candidate_handle": ""}
+    if candidates:
+        # A title match the digest contradicts is somebody else's terminal; two digest
+        # matches is an anomaly.  Choosing among candidates is the guess this gate forbids.
+        return {"handle": None, "handle_recovery": "unverified", "candidate_handle": ""}
+    return {"handle": None,
+            "handle_recovery": "not_listed" if scope_resolved else "scope_unresolved",
+            "candidate_handle": ""}
+
+
+def resolve_prepared_terminal(entry: Mapping[str, Any] | None, listing: Any, *,
+                              run_id: str,
+                              scope_resolved: bool = True) -> dict[str, Any]:
+    """The prepared-session decision table, as a pure function over a fetched listing.
+
+    Returns ``{"handle", "handle_recovery", "action", "code", "candidate_handle",
+    "confirmed_absent"}`` where ``action`` is ``"create"`` | ``"adopt"`` | ``"block"`` and
+    ``code`` is a member of ``orca_adapter.PAIR_PREPARATION_REFUSAL_CODES`` when
+    ``action == "block"``.
+
+    The I/O stays in the adapter; the decision stays pure, exactly as
+    :func:`resolve_terminal_handle` already splits them.  No member is added to
+    :data:`HANDLE_RECOVERY_OUTCOMES` and :func:`resolve_terminal_handle` is unchanged.
+    """
+    if entry is None:
+        # Nothing was prepared for this role.  The listing is NOT consulted: there is no
+        # title and no digest to resolve, so there is nothing a listing could decide.
+        return {"handle": None, "handle_recovery": "not_attempted", "action": "create",
+                "candidate_handle": "", "code": "", "confirmed_absent": False}
+    if entry.get("run_id") != run_id:
+        # `recorded_by` differing is NOT a mismatch: a successor process legitimately has
+        # a different owner id, and it is provenance only.
+        return {"handle": None, "handle_recovery": "unverified", "action": "block",
+                "code": "PAIR_PREPARATION_OWNERSHIP_MISMATCH", "candidate_handle": "",
+                "confirmed_absent": False}
+    stage = entry.get("stage")
+    if stage == "CREATE_REFUSED":
+        # The runtime itself reported, in a receipt THIS process parsed, that nothing was
+        # created.  Confirmed absence is the only outcome that permits a retry, and the
+        # listing is not consulted -- the parsed refusal is the proof.
+        return {"handle": None, "handle_recovery": "not_listed", "action": "create",
+                "code": "", "candidate_handle": "", "confirmed_absent": True}
+    observed = _resolve_prepared_listing(entry, listing, scope_resolved=scope_resolved)
+    if stage == "CREATE_INTENDED":
+        # A crash -- or an unparsed failure -- between the intent and its result-record is
+        # NEITHER success NOR confirmed absence.  The listing is still resolved so the
+        # refusal detail can REPORT what was enumerated, and it NEVER changes the verdict:
+        # `not_listed` here is not absence, because a create whose outcome nobody observed
+        # may have produced a session this listing cannot name.
+        return {**observed, "handle": None, "action": "block",
+                "code": "PAIR_PREPARATION_OUTCOME_UNKNOWN", "confirmed_absent": False}
+    if observed["handle_recovery"] == "listing_verified":          # CREATED / VERIFIED
+        return {**observed, "action": "adopt", "code": "", "confirmed_absent": False}
+    return {**observed, "handle": None, "action": "block",
+            "code": _PREPARED_BLOCK_CODES[observed["handle_recovery"]],
+            "confirmed_absent": False}
+
+
 # ---- the projection ------------------------------------------------------------------
 def project_pause(state: Mapping[str, Any]) -> dict[str, Any]:
     """The read-only human/auditor view of a paused run, derived ONLY from the checkpoint.

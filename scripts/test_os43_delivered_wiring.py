@@ -107,6 +107,23 @@ class OfflineOrcaHarness:
         self.requested_phases = tuple(requested_phases)
         return run_id
 
+    def routing_binding(self) -> dict:
+        """Tracks the real signature, exactly as ``resume_run`` above does.
+
+        OS-14: `OrcaAdapter._assert_preparation_binding` reconciles the run's durable
+        launch record against the harness's OWN statement of its routing identity, and
+        this double holds no `agent_routing` -- so it states what
+        `OrcaRuntimeHarness.routing_binding()` states with none: a POSITIVE "this run was
+        launched legacy", which is what this module's runs are. A double that omitted the
+        method would hide a signature drift, which is the very thing the `resume_run`
+        comment above exists to prevent; production refuses such a harness by name
+        (`PAIR_PREPARATION_BINDING_UNVERIFIABLE`) rather than crashing, and that refusal is
+        asserted on its own in `scripts/test_os14_pair_preparation.py`.
+        """
+        return {"runtime": "", "profile_name": "", "profile_source": "",
+                "routing_schema_version": "", "routing_digest": "",
+                "model_aware": "false", "driver_type_id": ""}
+
     def create_task(self, spec, *, deps=()):
         self.calls.append(("create_task", ""))
         return f"task_{len(self.calls)}"
@@ -180,6 +197,27 @@ class DeliveredWiringFixture(unittest.TestCase):
                      {"configurable": {"thread_id": "t", "checkpoint_ns": ""}})
         # lease_seconds=0.0: expired at the instant it is written, so the gate's "the
         # Coordinator's heartbeat expired" is a fact this test states rather than waits for.
+        # OS-14 FIXTURE FIDELITY, not a relaxed assertion. Every Orca-adapter run now
+        # carries a run-root launch record, written at run OPEN by
+        # `launcher.build_orca_adapter` for EVERY run, model-less ones included. This
+        # fixture produces its stalled checkpoint through `FakeAdapter` because that is
+        # the cheap way to get a GENUINELY interrupted head, and `OfflineOrcaHarness`
+        # stands in for the Orca harness during the recovery -- so a faithful stand-in for
+        # "a stalled ORCA run" has to carry the record an Orca launch would have written.
+        # Without it the adoption correctly refuses
+        # `PAIR_PREPARATION_LAUNCH_RECORD_ABSENT`, which is the DESIGNED outcome whenever
+        # a run's launch identity is unknown and is asserted directly, on its own, by
+        # `scripts/test_os14_pair_preparation.py` (T7(g), T9(j1)/(j2)). No assertion in
+        # this module is changed; the fixture simply stops omitting a durable record
+        # production always writes.
+        #
+        # The cells are exactly the routing-less statement
+        # `OrcaRuntimeHarness.routing_binding()` emits with no `agent_routing`: a POSITIVE
+        # "this run was launched legacy", which is what this fixture's runs are.
+        pause_store.pair_binding_for(run_id, artifact_base=self.base).record_binding(
+            runtime="", profile_name="", profile_source="",
+            routing_schema_version="", routing_digest="", model_aware="false",
+            driver_type_id="")
         store = coordinator_liveness.store_for(
             run_id, artifact_base=self.base,
             lease_seconds=0.0 if liveness == "EXPIRED" else 600.0)

@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from . import recovery_store
-from .contracts import BASE_CAPABILITIES
+from .contracts import BASE_CAPABILITIES, RISKS
 from .executor import IdempotencyRecoveryError, terminal_node
 from .runtime_state import (RuntimeStateConflict, resolve_runtime_state,
                             runtime_state_error_code)
@@ -2887,6 +2887,13 @@ ORCA_ADAPTER_REQUIRES_STATE = "ORCA_ADAPTER_REQUIRES_STATE"
 ORCA_ADAPTER_REQUIRES_OBJECTIVE = "ORCA_ADAPTER_REQUIRES_OBJECTIVE"
 ORCA_ADAPTER_REQUIRES_AGENT_PROFILE = "ORCA_ADAPTER_REQUIRES_AGENT_PROFILE"
 ORCA_RUNTIME_UNAVAILABLE = "ORCA_RUNTIME_UNAVAILABLE"
+#: OS-14: a relaunch of the SAME run id under a DIFFERENT routing or launch kind is
+#: refused at the launch boundary, before any Task, exactly as `check_standalone_authority`
+#: refuses to silently re-bind a standalone launch.
+ORCA_RUN_BINDING_CONFLICT = "ORCA_RUN_BINDING_CONFLICT"
+#: OS-14: a MODEL-AWARE adoption whose run declares no readable phases/risk.  A legacy
+#: adoption never performs that read and keeps today's behaviour exactly.
+ORCA_RUN_DECLARATION_UNREADABLE = "ORCA_RUN_DECLARATION_UNREADABLE"
 
 
 def _skill_md_path() -> Path:
@@ -3012,6 +3019,16 @@ def orca_run_routing(*, agent_profile_name: str, requested_phases: tuple[str, ..
             routing,
             model_capabilities=agent_profile.model_selection_capabilities(model_driver),
         )
+        # OS-14: the driver's DURABLE CLASS IDENTITY, derived on BOTH doors -- launch and
+        # adoption -- before a harness, Run, Task, Dispatch or terminal exists.  A driver
+        # whose class cannot be named durably (a `<locals>` class, a `type("X", ...)`
+        # built at run time) may not open a model-aware run at all, because the launch
+        # record would otherwise bind a string a DIFFERENT class could reproduce.  It is
+        # DERIVED, not stored, here: the cell itself is written by
+        # `harness.routing_binding()`, the one derivation the recorder and the checker
+        # both read.  Refusing here rather than there is what makes the earliest door the
+        # strictest one.
+        agent_profile.driver_type_id(model_driver)
     except agent_profile.AgentProfileError as exc:
         raise LauncherError(
             f"{ORCA_ADAPTER_REQUIRES_AGENT_PROFILE}: {exc.reason}: {exc}") from exc
@@ -3073,9 +3090,25 @@ def build_orca_adapter(spec: dict[str, Any], *, objective: str, artifact_base: P
             objective, requested_phases=tuple(phase.lower() for phase in phases))
     except runtime.OrcaRuntimeError as exc:
         raise LauncherError(f"{ORCA_RUNTIME_UNAVAILABLE}: {exc}") from exc
+    # ---- OS-14: the LAUNCH RECORD, at run OPEN, for EVERY run ----
+    # The earliest instant a run_id and a run root exist, and strictly BEFORE
+    # `build_graph` and therefore before the executor's claim: no successor can observe a
+    # CLAIMED record without also being able to read this binding.  Written
+    # UNCONDITIONALLY -- `model_aware` is a recorded "true"/"false", NOT a guard on
+    # whether the file exists -- so "absent" can never be mistaken for "legacy".
+    from . import pause_store
+    binding_store = pause_store.pair_binding_for(run_id, artifact_base=artifact_base)
+    try:
+        binding_store.record_binding(**harness.routing_binding())
+    except pause_store.PauseStoreError as exc:
+        raise LauncherError(f"{ORCA_RUN_BINDING_CONFLICT}: {exc}") from exc
     state = build_state({**spec, "run_id": run_id})
     from .orca_adapter import OrcaAdapter
-    return OrcaAdapter(harness, runtime_state=runtime_state), state
+    return OrcaAdapter(
+        harness, runtime_state=runtime_state,
+        pair_binding=binding_store,
+        pair_preparation=pause_store.pair_preparation_for(
+            run_id, artifact_base=artifact_base)), state
 
 
 def demo_results() -> list[dict[str, Any]]:
@@ -3724,16 +3757,100 @@ def declared_phases_for_run(run_id: str, *, artifact_base: Path) -> tuple[str, .
     return tuple(str(phase).lower() for phase in phases)
 
 
+def declared_run_identity_for_run(run_id: str, *,
+                                  artifact_base: Path) -> tuple[tuple[str, ...], str]:
+    """The adopted run's OWN declared phases AND risk, from ONE read of ONE committed head.
+
+    :func:`declared_phases_for_run` is UNTOUCHED.  It answers ``()`` for an unreadable head
+    ON PURPOSE -- it feeds ``resume_run``, where the ENGINE's own read is the authority --
+    and every shipped OS-43 recovery depends on that.  This is a DIFFERENT question with a
+    DIFFERENT failure rule, and it exists because phases and risk are BOTH inputs to the
+    routing digest that GATES a model-aware adoption: ``agent_profile.required_roles``
+    marks a phase Reviewer required only when ``risk in ("medium", "high")``, that flag
+    lands on every ``RoleRouting.required``, and ``routing_binding()`` digests each entry's
+    ``required`` bit.  A default is therefore not a harmless default, and ``()`` is not a
+    harmless empty: either one reconstructs a routing this run never had.
+
+    ONE read, because two reads of one document can disagree.  FAIL-CLOSED, BY NAME, and
+    never a guess:
+
+      * the head cannot be read -> ``resolve_head`` raises and the refusal is named, not
+        swallowed: an unreadable authority is not an absent one;
+      * the head is ``None`` -- the run has committed no checkpoint for this ``run_id`` --
+        -> REFUSE: an absent declaration is not an empty one;
+      * ``risk`` is absent or outside ``contracts.RISKS`` -> REFUSE.  ``resolve_head``'s own
+        ``validate_state`` already rejects that, so this is a RE-assertion, not the only
+        check: the launcher never hands an unvalidated string to ``materialize_run_routing``;
+      * ``requested_phases`` is empty -> REFUSE: the digest is computed over them.
+
+    Returns ``(phases, risk)`` or raises.  Never a partial answer, never a default.
+
+    Every refusal is raised BEFORE the harness factory, so no harness, Run, Task, Dispatch,
+    terminal or durable write exists when it fires.  The honest cost, stated: a run that
+    stalled BEFORE its engine committed any checkpoint cannot be adopted model-aware -- it
+    BLOCKS by name with 0 effects instead of being reconstructed from a guess.
+    """
+    from . import recovery_runtime
+    try:
+        head = recovery_runtime.resolve_head(run_id, artifact_base=artifact_base)
+    except Exception as exc:  # noqa: BLE001 - unreadable is REFUSED, never guessed
+        raise LauncherError(
+            f"{ORCA_RUN_DECLARATION_UNREADABLE}: the committed checkpoint of run "
+            f"{run_id!r} could not be read ({exc}); a model-aware adoption reconstructs "
+            "this run's routing from the run's own declaration and will not guess one"
+        ) from exc
+    if head is None:
+        raise LauncherError(
+            f"{ORCA_RUN_DECLARATION_UNREADABLE}: run {run_id!r} has committed no workflow "
+            "checkpoint, so it declares neither phases nor risk; an absent declaration is "
+            "not an empty one and no routing is reconstructed from it")
+    risk = str(head.state.get("risk") or "")
+    if risk not in RISKS:
+        raise LauncherError(
+            f"{ORCA_RUN_DECLARATION_UNREADABLE}: run {run_id!r} declares risk {risk!r}, "
+            f"which is not one of {RISKS}; no routing is reconstructed and no Run, Task, "
+            "Dispatch or terminal is created")
+    phases = tuple(
+        str(phase).lower() for phase in (head.state.get("requested_phases") or ()))
+    if not phases:
+        raise LauncherError(
+            f"{ORCA_RUN_DECLARATION_UNREADABLE}: run {run_id!r} declares no requested "
+            "phases; the routing digest is computed over them and is not reconstructed "
+            "from an empty set")
+    return phases, risk
+
+
 def build_orca_adapter_for_run(run_id: str, *, artifact_base: Path,
                                runtime_state: Any = None, run_owner: str = "",
                                project_root: Path | None = None,
-                               harness_factory: Any = None) -> Any:
+                               harness_factory: Any = None,
+                               agent_profile_name: str = "",
+                               model_driver: Any = None) -> Any:
     """An ``OrcaAdapter`` bound to an EXISTING Run, for recovery rather than for launch.
 
     ``build_orca_adapter`` CREATES a Run, which is exactly wrong here: a recovery adopts
     the run that is already stalled.  ``OrcaRuntimeHarness.resume_run`` is the documented
     adoption path and it restores the delivery ledger before returning, so the adapter this
     returns is a successor process in the OS-44 sense rather than a fresh one.
+
+    OS-14 adds TWO additive keywords, and with BOTH omitted the construction is
+    byte-identical to what it was before they existed -- the harness keeps its default
+    ``risk="high"`` / ``risk_source="default"`` and no shipped OS-43 recovery changes
+    behaviour, including one whose checkpoint head cannot be read.
+
+    Supplied, they reconstruct the run's model-aware equivalence from RE-VERIFIABLE sources
+    only: the profile document (through the existing ``orca_run_routing``, Gate A included)
+    and the run's OWN committed declaration -- its requested phases AND its risk, read
+    together by :func:`declared_run_identity_for_run`.  The reconstruction is then
+    RECONCILED BY DIGEST against the durable launch record by
+    ``OrcaAdapter._assert_preparation_binding``, which refuses a reconstruction that is not
+    this run's own rather than silently delivering a different agent or model identity under
+    the old run's name.  The DRIVER is re-injected through the same seam, never
+    reconstructed -- a live object cannot come from a durable record.
+
+    An adoption NEVER writes a launch record.  Only ``build_orca_adapter`` does, at run
+    OPEN, so a successor cannot create the authority it is supposed to be checked against
+    and an absent record cannot be "repaired" by re-binding.
     """
     runtime = _import_orca_runtime()
     if not run_owner:
@@ -3742,15 +3859,51 @@ def build_orca_adapter_for_run(run_id: str, *, artifact_base: Path,
             "needs --run-owner, the terminal handle that owns it")
     root = Path(project_root) if project_root is not None else Path.cwd()
     factory = harness_factory or runtime.OrcaRuntimeHarness
+    routing = None
+    model_seam: dict[str, Any] = {}
+    risk_seam: dict[str, Any] = {}
+    phases: tuple[str, ...] | None = None
+    if agent_profile_name:
+        # Reconstructed through the EXISTING derivation, Gate A included, from the run's
+        # OWN committed declaration -- phases AND risk, from ONE read -- never from a
+        # fresh launch specification and never from a default.
+        phases, declared_risk = declared_run_identity_for_run(
+            run_id, artifact_base=artifact_base)
+        routing = orca_run_routing(
+            agent_profile_name=agent_profile_name, requested_phases=phases,
+            risk=declared_risk, project_root=root, model_driver=model_driver)
+        model_seam = {} if model_driver is None else {"model_driver": model_driver}
+        # The adopted harness's OWN risk must be the RUN's, not this constructor's default
+        # "high": `self.risk == "low"` is what decides whether a dependent Reviewer Task
+        # is created at all, so a harness at a different risk than the routing it was
+        # handed would disagree with Gate A about whether this run even HAS a pair to
+        # admit.  One value, both places -- exactly the `model_driver` discipline above.
+        risk_seam = {"risk": declared_risk}
     try:
-        harness = factory(artifact_base, quality_profile_root=root)
+        harness = factory(artifact_base, quality_profile_root=root, **risk_seam,
+                          **({"agent_routing": routing} if routing is not None else {}),
+                          **model_seam)
+        # The model-aware lane reuses the phases it ALREADY read: two reads of one
+        # document can disagree.  The legacy lane keeps the shipped call VERBATIM, and in
+        # the shipped SHAPE: `scripts/test_os43_oneshot_cli.py` pins this call's source
+        # text -- `harness.resume_run(run_id, run_owner=run_owner,` and
+        # `requested_phases=declared_phases_for_run(` -- to prove the orca branch ADOPTS a
+        # run rather than creating one, so both spellings are preserved exactly and the
+        # model-aware reuse is expressed as the conditional TAIL rather than by rewriting
+        # them.
         harness.resume_run(run_id, run_owner=run_owner,
                            requested_phases=declared_phases_for_run(
-                               run_id, artifact_base=artifact_base))
+                               run_id, artifact_base=artifact_base)
+                           if phases is None else phases)
     except runtime.OrcaRuntimeError as exc:
         raise LauncherError(f"{ORCA_RUNTIME_UNAVAILABLE}: {exc}") from exc
+    from . import pause_store
     from .orca_adapter import OrcaAdapter
-    return OrcaAdapter(harness, runtime_state=runtime_state)
+    return OrcaAdapter(
+        harness, runtime_state=runtime_state,
+        pair_binding=pause_store.pair_binding_for(run_id, artifact_base=artifact_base),
+        pair_preparation=pause_store.pair_preparation_for(
+            run_id, artifact_base=artifact_base))
 
 
 def build_watchdog_parser() -> argparse.ArgumentParser:

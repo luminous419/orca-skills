@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -53,6 +54,7 @@ try:
         MODEL_SELECTION_VERIFIED_CAPABILITY,
         MODEL_TOKEN_PATTERN,
         REASON_WORKER_REVIEWER_MUST_DIFFER,
+        driver_type_id,
         effective_identity_independent,
         model_selection_capabilities,
     )
@@ -96,6 +98,7 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
         MODEL_SELECTION_VERIFIED_CAPABILITY,
         MODEL_TOKEN_PATTERN,
         REASON_WORKER_REVIEWER_MUST_DIFFER,
+        driver_type_id,
         effective_identity_independent,
         model_selection_capabilities,
     )
@@ -528,6 +531,49 @@ def completion_timestamp(dispatch_row: dict[str, Any]) -> str | None:
 
 class OrcaRuntimeError(RuntimeError):
     pass
+
+
+def _receipt_error_code(payload: Any) -> str:
+    """`payload["error"]["code"]` when it is a string, else "". No message text, no
+    traceback text, no regex: a code is read where the runtime puts a code, or not at all.
+    """
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        code = error.get("code")
+        if isinstance(code, str):
+            return code
+    return ""
+
+
+class OrcaCommandRefused(OrcaRuntimeError):
+    """The runtime itself reported a failure IN A RECEIPT THIS PROCESS PARSED.
+
+    A non-JSON, truncated, lost or transport-level failure is NOT this class: it stays a
+    plain `OrcaRuntimeError`, because nothing was read back that says what happened. That
+    distinction is the whole point: "the runtime refused" is CONFIRMED ABSENCE of the
+    effect, and "the response could not be read" is an UNKNOWN outcome, and a durable
+    record that conflates them is guessing.
+
+    A SUBCLASS, so every existing `except OrcaRuntimeError` and every
+    `assertRaises(OrcaRuntimeError)` binds exactly as before.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        command: tuple[str, ...],
+        ok: Any,
+        returncode: int,
+        error_code: str,
+        receipt_digest: str,
+    ) -> None:
+        super().__init__(message)
+        self.command = tuple(command)   # the exact argv tuple, verbatim, no re-rendering
+        self.ok = ok                    # payload["ok"] as the PRIMITIVE it was, or None
+        self.returncode = returncode    # the process exit status
+        self.error_code = error_code    # payload["error"]["code"] when present, else ""
+        self.receipt_digest = receipt_digest  # sha256 of canonical JSON of the payload
 
 
 class DecisionGateRefused(OrcaRuntimeError):
@@ -1648,8 +1694,21 @@ class OrcaRuntimeHarness:
         # A failed command is still a command that was sent: record it before raising.
         self._raw.append({"command": list(args), "response": payload})
         if (returncode != 0 or not payload.get("ok")) and not allow_error:
-            raise OrcaRuntimeError(
-                f"Orca command failed ({' '.join(args)}): {payload.get('error')}"
+            # TYPED, because a parsed receipt that says `ok:false` is the runtime's own
+            # report that the effect did NOT happen -- the only evidence a durable record
+            # may read as confirmed absence. The `json.JSONDecodeError` branch above keeps
+            # raising the BASE class: a response that was never parsed says nothing.
+            raise OrcaCommandRefused(
+                f"Orca command failed ({' '.join(args)}): {payload.get('error')}",
+                command=tuple(args),
+                ok=payload.get("ok"),
+                returncode=returncode,
+                error_code=_receipt_error_code(payload),
+                receipt_digest=hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+                        "utf-8"
+                    )
+                ).hexdigest(),
             )
         return payload
 
@@ -1750,6 +1809,51 @@ class OrcaRuntimeHarness:
         )
         row["action"] = "retained"
         return row
+
+    def adopt_prepared_terminal(
+        self, handle: str, role: str, *, phase: str = ""
+    ) -> dict[str, Any]:
+        """Register a DIGEST-PROVED prepared session in THIS process's ledger.
+
+        The successor-process counterpart of what `create_fake_terminal` does for a
+        session this process created, and the same pattern `OrcaAdapter.account_dispatch`
+        already uses to re-seed a recovered handle from the journal before consuming
+        harness ledger state.
+
+        Provenance is the SAME derivation `create_fake_terminal` records, read from the
+        LIVE routing rather than from the durable record -- so an adoption cannot import
+        a predecessor's declaration.
+
+        RESTORES NO VERIFICATION AUTHORITY, and cannot: `register_terminal` takes no
+        `resolved_model` parameter at all and writes that cell "" on a new row, and the
+        only states supplied here are `requested` / `none`. `_model_identity`,
+        `_model_session_identity`, `_model_role_history` and `_model_session_history` are
+        NOT touched -- a positive re-verification through the live driver is the only way
+        this process gains authority for the session.
+
+        IDEMPOTENT, and provenance-preserving on a SAME-PROCESS re-entry: a handle this
+        process created is already in `self._terminals`, and `register_terminal`'s
+        existing-row branch transfers ownership without touching `role` or `origin`, so a
+        self-created session keeps `origin == "self_created"` and only an unseen handle is
+        recorded as `adopted`.
+
+        Issues NO `orca` command: it is a ledger write over a handle a parsed listing
+        already proved (`listing_verified`), never a probe.
+        """
+        requested_model = self.resolved_agent_model(role, phase)
+        return self.register_terminal(
+            handle,
+            role="active_worker",
+            origin="adopted",
+            intended_role=(
+                "phase_reviewer" if role.endswith("reviewer") else "phase_worker"
+            ),
+            agent_command=self.resolved_agent_command(role, phase),
+            requested_model=requested_model,
+            model_state=(
+                MODEL_EVIDENCE_REQUESTED if requested_model else MODEL_EVIDENCE_NONE
+            ),
+        )
 
     def _rebind_model_evidence(self, handle: str, dispatch_id: str) -> None:
         """OS-49. Rebind the barrier's accepted evidence to the Dispatch id.
@@ -3045,6 +3149,127 @@ class OrcaRuntimeHarness:
         entry = self._routing_entry_for(role, phase)
         return entry.model if entry is not None else ""
 
+    def routing_binding(self) -> dict[str, str]:
+        """The run's ROUTING IDENTITY as the launch record's own closed cells.
+
+        ONE derivation, on the object that owns BOTH `agent_routing` and `model_driver`,
+        read by the RECORDER (`launcher.build_orca_adapter`) and by the CHECKER
+        (`OrcaAdapter._assert_preparation_binding`) -- so the two cannot drift, and
+        neither holds a copy of the model-awareness predicate.
+
+        Its key set is EXACTLY `pause_store.PAIR_LAUNCH_IDENTITY_KEYS`, which is derived
+        from `PAIR_BINDING_KEYS` rather than re-spelled. That is what makes the checker's
+        comparison total: it iterates the tuple, so every cell this method emits -- the
+        DRIVER cell included -- is compared, and a cell added here in a later schema
+        version cannot be silently left out of the check.
+
+        Side-effect-free: it reads routing fields and derives the driver's class identity.
+        """
+        routing = self.agent_routing
+        aware = routing is not None and self._routing_is_model_aware(routing)
+        if routing is not None:
+            cells = {
+                "runtime": str(getattr(routing, "runtime", "") or ""),
+                "profile_name": str(getattr(routing, "profile_name", "") or ""),
+                "profile_source": str(getattr(routing, "profile_source", "") or ""),
+                "routing_schema_version": str(
+                    int(getattr(routing, "schema_version", 0) or 0)
+                ),
+            }
+        else:
+            cells = {
+                "runtime": "",
+                "profile_name": "",
+                "profile_source": "",
+                "routing_schema_version": "",
+            }
+        if not aware:
+            # A POSITIVE legacy statement: no routing identity to bind, and the empty
+            # cells SAY so rather than omitting a key from the closed set.
+            return {
+                **cells,
+                "routing_digest": "",
+                "model_aware": "false",
+                "driver_type_id": "",
+            }
+        identity = {
+            "runtime": cells["runtime"],
+            "profile_name": cells["profile_name"],
+            "profile_source": cells["profile_source"],
+            "schema_version": cells["routing_schema_version"],
+            "requested_phases": sorted(str(p) for p in routing.requested_phases),
+            "entries": sorted(
+                [
+                    str(entry.phase),
+                    str(entry.role),
+                    str(entry.command),
+                    str(entry.model),
+                    bool(entry.required),
+                    bool(entry.resolved),
+                ]
+                for entry in routing.entries
+            ),
+        }
+        return {
+            **cells,
+            "model_aware": "true",
+            "routing_digest": hashlib.sha256(
+                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            ).hexdigest(),
+            # The ONE derivation, in `agent_profile`. `type(...).__name__` is NOT used
+            # here or anywhere else: two different classes can share it.
+            "driver_type_id": driver_type_id(self.model_driver),
+        }
+
+    def _same_command_pair(
+        self, *, phase: str, command: str, counterpart_role: str
+    ) -> bool:
+        """The ONE same-command pair predicate. Read by THREE call sites, so no two
+        copies can disagree about which pairs the rule covers -- the defect this module's
+        own docstring names one layer up.
+
+        Scoped exactly as Gate A's pair check is: to a counterpart that is REQUIRED and
+        resolved. At LOW risk the Reviewer entry exists but is optional and no Reviewer is
+        ever dispatched, so there is no pair to admit.
+        """
+        routing = self.agent_routing
+        if routing is None:
+            return False
+        counterpart_entry = routing.for_role(phase, counterpart_role)
+        return bool(
+            counterpart_entry is not None
+            and counterpart_entry.required
+            and counterpart_entry.resolved
+            and counterpart_entry.command == command
+        )
+
+    def pair_admission_required(self, role: str, phase: str = "") -> bool:
+        """PUBLIC, side-effect-free: does a delivery to `(role, phase)` require a
+        positively verified COUNTERPART? Raises nothing, mints nothing, observes nothing.
+
+        `False` on a legacy run, on a role with no declared model, for the Final Reviewer
+        (which is deliberately outside the pair rule) and for a distinct-command pair.
+        `OrcaAdapter` reads THIS -- it keeps no copy.
+        """
+        routing = self.agent_routing
+        if routing is None:
+            return False                       # legacy: no pair rule at all
+        barrier_phase = self._barrier_phase(role, phase)
+        entry = self._routing_entry_for(role, barrier_phase)
+        if entry is None or not entry.model:
+            return False                       # evidence state `none`
+        routing_role = self._routing_key(role, barrier_phase)[1]
+        counterpart_role = {"worker": "reviewer", "reviewer": "worker"}.get(routing_role)
+        if counterpart_role is None:
+            return False                       # the Final Reviewer
+        return self._same_command_pair(
+            phase=barrier_phase,
+            command=entry.command,
+            counterpart_role=counterpart_role,
+        )
+
     def wait_for_tui_idle(self, terminal: str) -> str:
         """Middle rung of the custom-command placement ladder (SKILL.md section 6).
 
@@ -3425,6 +3650,23 @@ class OrcaRuntimeHarness:
         if row is not None:
             row.update(self._MODEL_ROW_CLEARED)
 
+    def invalidate_model_authority(self, terminal: str) -> None:
+        """PUBLIC: revoke this session's model verification AUTHORITY, keep its HISTORY.
+
+        OS-14 BUGFIX (review B2).  A caller that refuses an attempt AFTER
+        `verify_model_identity()` has already run cannot leave the session advertising a
+        verification it has just rejected: selection is the act that switches the session,
+        so by then the physical model is whatever the driver left it on.  The one existing
+        operation with exactly that meaning is `_stale_model_evidence()`, and this is its
+        public name -- no second copy, no new rule, and strictly a REVOCATION: it can only
+        ever make a later delivery MORE refused.
+
+        `_model_role_history` / `_model_session_history` are deliberately untouched, for
+        the reason `_stale_model_evidence()`'s own docstring gives: revoking authority is
+        the job, erasing history was the defect.
+        """
+        self._stale_model_evidence(terminal)
+
     def _gate_b_model_identity(
         self, *, task_id: str, terminal: str, role: str, phase: str, attempt: int
     ) -> dict[str, Any]:
@@ -3496,6 +3738,10 @@ class OrcaRuntimeHarness:
 
         A no-op on a legacy run and on a role with no declared model, exactly as Gate B
         is -- so a caller may call it unconditionally.
+
+        OS-14: its PRODUCTION caller is `OrcaAdapter._prepare_pair`, which calls it for
+        BOTH roles of a gate round, on every pass, before the first delivery of either --
+        so the next reader does not have to rediscover that this pre-pass now has one.
         """
         self._verify_model_identity(
             task_id=task_id,
@@ -3693,12 +3939,8 @@ class OrcaRuntimeHarness:
             # routing entry the post-selection copy reads, and with the same
             # required/resolved predicate, so the hoist and the backstop cannot disagree
             # about which pairs the rule covers.
-            counterpart_entry = self.agent_routing.for_role(phase, counterpart_role)
-            if (
-                counterpart_entry is not None
-                and counterpart_entry.required
-                and counterpart_entry.resolved
-                and counterpart_entry.command == command
+            if self._same_command_pair(
+                phase=phase, command=command, counterpart_role=counterpart_role
             ):
                 raise self._model_refusal(
                     MODEL_SELECTION_PAIR_UNADMITTED,
@@ -4204,11 +4446,10 @@ class OrcaRuntimeHarness:
                 # repository's standing rule is that a role nobody dispatches must not fail a
                 # run (the same reason the PATH check is scoped to required roles). An
                 # unresolved required role is validate_required_roles()' business.
-                same_command = (
-                    counterpart_entry is not None
-                    and counterpart_entry.required
-                    and counterpart_entry.resolved
-                    and counterpart_entry.command == command
+                # Read through the ONE predicate `pair_admission_required()` reads, so the
+                # hoisted copy, this backstop and the public predicate cannot disagree.
+                same_command = self._same_command_pair(
+                    phase=phase, command=command, counterpart_role=counterpart_role
                 )
                 if counterpart is None:
                     # OS-49 iteration 2 (final review R2), retained as the POST-selection
