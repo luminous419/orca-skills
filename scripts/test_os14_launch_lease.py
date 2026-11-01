@@ -28,8 +28,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import unittest
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 from scripts.agent_profile import (HOSTED_DELIVERY_CAPABILITY,
                                    hosted_delivery_capabilities,
@@ -54,6 +57,39 @@ from scripts.test_os14_pair_preparation import (PHASE, PHASE_UPPER,
                                                 REQUIRES_LANGGRAPH, RUN_ID,
                                                 PairRecorder, PairRoom,
                                                 scripted_bodies)
+
+
+# ======================================================================================
+# the NO-REAL-CLI guard — module-wide, so no test here can need an `orca` binary
+# ======================================================================================
+#: The path `_resolve_orca` is told to use.  It is consulted BEFORE `shutil.which("orca")`
+#: (`orca_runtime_harness._resolve_orca`), so with it set the harness constructs on a host
+#: that has no Orca CLI at all -- which every CI runner is.  The value is the one the rest
+#: of this repository's harness tests already use (`test_os14_pair_preparation`,
+#: `test_os49_delivery_barrier`), so a reader recognises it.
+#:
+#: **Why module-wide and not only at the one construction site.** `OrcaRuntimeHarness.__init__`
+#: resolves the executable unconditionally, so ANY direct construction fails on a host
+#: without the binary.  CI proved that: one test built a successor harness without this and
+#: five of six lanes errored, while both local lanes were green because a real `orca` was on
+#: PATH.  A module-level guard makes the whole module independent of the host rather than
+#: making one test independent of it, so a test added later cannot reintroduce the
+#: dependency.  It weakens nothing: every test in this module replaces the harness's single
+#: process boundary (`_exec_orca`) with a recorder, so the resolved path is never executed --
+#: it only has to exist as a STRING.
+NO_REAL_CLI = "/opt/orca-dev"
+_CLI_GUARD: Any = None
+
+
+def setUpModule() -> None:
+    global _CLI_GUARD
+    _CLI_GUARD = patch.dict(os.environ, {"ORCA_CLI_COMMAND": NO_REAL_CLI})
+    _CLI_GUARD.start()
+
+
+def tearDownModule() -> None:
+    if _CLI_GUARD is not None:
+        _CLI_GUARD.stop()
 
 
 # ======================================================================================
@@ -954,9 +990,20 @@ class ProtectionTests(LeaseRoom):
         # a NEW harness and a NEW adapter over the SAME durable documents.  Nothing is
         # copied from the predecessor -- not the registry, not the bindings, not the
         # authority maps.
-        successor_harness = OrcaRuntimeHarness(
-            self.project, agent_routing=launch.harness.agent_routing,
-            model_driver=LeaseCitingDriver(resolve=lambda requested: requested))
+        #
+        # `ORCA_CLI_COMMAND` is patched AT THE SITE as well as module-wide, and that is
+        # deliberate rather than redundant: `OrcaRuntimeHarness.__init__` resolves the
+        # executable unconditionally, this is the ONE place in this module that constructs
+        # a harness directly instead of through `PairRoom.harness_factory` (which patches
+        # it itself), and CI is where that showed -- five of six lanes errored here with
+        # `Orca CLI executable was not found` while both local lanes were green on a host
+        # that happened to have the binary.  Written here so the construction reads
+        # correctly in isolation, matching `test_os14_pair_preparation` and
+        # `test_os49_delivery_barrier`.
+        with patch.dict(os.environ, {"ORCA_CLI_COMMAND": NO_REAL_CLI}):
+            successor_harness = OrcaRuntimeHarness(
+                self.project, agent_routing=launch.harness.agent_routing,
+                model_driver=LeaseCitingDriver(resolve=lambda requested: requested))
         successor_harness.run_id = launch.harness.run_id
         successor = OrcaAdapter(
             successor_harness,
@@ -1171,6 +1218,36 @@ class LeaseContractLockTests(unittest.TestCase):
             launch_stamp=1, session_uuid="u", endpoint_path="/tmp/secret-path.sock",
             endpoint_digest="d", launch_argv_digest="a")
         self.assertNotIn("/tmp/secret-path.sock", json.dumps(lease.durable_cells()))
+
+
+class NoRealCliTests(unittest.TestCase):
+    """The guard above is a PROPERTY of this module, so it is asserted rather than assumed.
+
+    CI failed on exactly this: a harness built without `ORCA_CLI_COMMAND` raises
+    `OrcaRuntimeError("Orca CLI executable was not found")` on a host with no `orca` on
+    PATH, and both local lanes hid it because the developer machine has one.  These two
+    rows fail if `setUpModule` is ever removed or weakened.
+    """
+
+    def test_the_module_guard_is_active(self):
+        self.assertEqual(os.environ.get("ORCA_CLI_COMMAND"), NO_REAL_CLI,
+                         "setUpModule's ORCA_CLI_COMMAND guard is not in force, so a "
+                         "harness built here would need a real Orca CLI")
+
+    def test_a_harness_constructs_with_no_orca_on_path_at_all(self):
+        """The direct proof, and the one CI would have caught the regression with:
+        `PATH` is EMPTIED, so `shutil.which("orca")` can find nothing, and the harness
+        still constructs because `_resolve_orca` reads the environment variable first."""
+        import tempfile
+        import shutil as _shutil
+        self.assertIsNone(_shutil.which("orca", path=""),
+                          "an empty PATH must resolve no orca, or this proves nothing")
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {"PATH": ""}):
+                harness = OrcaRuntimeHarness(Path(directory))
+        self.assertEqual(harness.orca, NO_REAL_CLI,
+                         "the harness resolved its executable from the environment, "
+                         "never from a real binary on PATH")
 
 
 if __name__ == "__main__":                          # pragma: no cover

@@ -3,8 +3,15 @@
 **Why this file exists.** `docs/OS-14-claude-driver-design.md` rests on measurements whose raw
 records live under `artifacts/runs/run_fd87428a21f0/evidence/`, which is **not committed**. A
 reviewer with no access to that directory needs the observations, the exact values and — above
-all — the **limits**, without taking the design's word for them. **Nothing here is an approval:**
-D2, D3, D5, D8 and the product permission scope are **승인 대기**.
+all — the **limits**, without taking the design's word for them. **Nothing in THIS FILE is an
+approval, and nothing in it was changed by one.** *(Superseded 2026-11-01: this line previously
+read "D2, D3, D5, D8 and the product permission scope are 승인 대기".)* The current status, which
+this file does not itself grant, is recorded in `docs/OS-14-claude-driver-design.md`'s top status
+block and §6: **D2, D3, D5 and D8-a..d were APPROVED by the user on 2026-11-01** for the local
+first implementation (Jira OS-14 comment 10101), and the **product permission scope remains
+승인 대기 (PENDING)** with its written proposal explicitly unexecuted. **Approval is not
+measurement:** every limit below stands exactly as measured, and an approved decision does not
+convert a 미검증 item into a verified one.
 
 **Provenance.** Run `run_fd87428a21f0` (ANALYSIS, risk high, analysis only): `ANALYSIS.md`
 COMPLETE, `REVIEW_ANALYSIS.md` and `FINAL_REVIEW.md` both **PASS WITH NOTES**, `FINAL_RESULT.md`

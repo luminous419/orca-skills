@@ -277,7 +277,13 @@ states the exclusion in its own words:
 session — plus `token` (`:985`) and `stamp` (`:987`), the two ordinals the harness counts.
 `MODEL_SELECTION_OBSERVATION_METHODS` (`:872`) is likewise one fake-only member.
 
-### Recommendation (conditional on D2) — **corrected**
+### Recommendation — **D2, APPROVED 2026-11-01** — **corrected**
+
+> **STATUS.** This recommendation was **approved by the user on 2026-11-01** as **D2**, for
+> the **local first implementation** (Jira OS-14 comment 10101). *(Superseded 2026-11-01:
+> this heading read "Recommendation (conditional on D2)".)* **Approval is not
+> implementation:** the lease half is implemented as **I-1 / I-4**; the contract-value
+> replacement this recommendation also needs is **I-3** and is **not started**.
 
 An earlier edition of this section recommended treating *"this attempt's driver composes an
 argv from this ticket's `requested_model`, inside its single `select_and_verify` call"* as the
@@ -289,9 +295,11 @@ when no `--model` act occurs at all (§3a.2). No driver call contains a launch.
 **The replacement recommendation: a launch-scoped request, minted by the harness and durably
 bound before the terminal is created, which every later driver call must cite and
 revalidate — never re-pretend.** It is specified, with both options and the full binding and
-revocation rules, in **§6 D2 (option B)**, and it is **승인 대기**: it widens the request
-leg's meaning from "this attempt asked" to "this attempt exercised an unrevoked launch this
-run made and recorded", and it replaces one locked contract value.
+revocation rules, in **§6 D2 (option B)**, and it is **APPROVED (2026-11-01)** for the local
+first implementation: it widens the request leg's meaning from "this attempt asked" to "this
+attempt exercised an unrevoked launch this run made and recorded", and it replaces one locked
+contract value — a replacement **I-3 has not yet made**, so the widened request leg is
+implemented (I-1) while the contract value still stands unchanged.
 
 What survives from the earlier reading, and is still the reason this is a decision rather
 than an interpretation: `:835-838` excludes an argv *composed before the session existed*,
@@ -340,7 +348,11 @@ without B1-c produces a ticket bound to a process whose owner is unspecified.
 - **It does not make the fake seam's success mean more.** The reference driver's leg 2
   re-reads the value its own leg 1 stored (`fake_adapter.py:291-295`): an echo.
 
-### Change scope if approved
+### Change scope — the scope D2's approval authorises
+
+*(Superseded 2026-11-01: this heading read "Change scope if approved". D2 was approved on
+2026-11-01, so the scope below is authorised; what remains open is only how much of it this
+PR implemented, which the top status block's per-unit table states.)*
 
 `scripts/orca_runtime_harness.py` (`:844`, `:872`, and the ticket shape at `:951-987` plus the
 freshness key at `:4347-4366`), the mirrored copy under
@@ -503,7 +515,8 @@ as they are.
 
 ### Recommendation
 
-**(A), explicitly scoped to `claude -p`, and explicitly conditional on D8.** It is the only
+**(A), explicitly scoped to `claude -p`. APPROVED under D8-a on 2026-11-01.** *(Superseded
+2026-11-01: this sentence read "and explicitly conditional on D8".)* It is the only
 candidate in which a positive verification can precede delivery and for which the mechanism
 has actually been measured. The scope limit is not decoration: Orca operates long-lived
 terminal sessions, and **E16/E17 do not represent that**.
@@ -514,7 +527,9 @@ Two consequences must be accepted with it, not discovered later:
    delivered afterwards. Either the driver keeps the process and the engine gains a "deliver
    into this held process" step, or the process is re-entered — and re-entry is `--resume`,
    which inherits the last selection silently and therefore needs its own re-verification.
-   Who owns that process, and until when, is **B1-c / D8**, undecided.
+   Who owns that process, and until when, is **B1-c / D8** — **decided 2026-11-01**: the
+   target, channel and lease are held for the whole gate ROUND (D8-b / §3a.12.1 TL) and
+   termination is nobody's in this engine (D8-d).
 2. **Cost is one extra turn per attempt** (≈2 s measured locally, plus whatever a gateway
    adds). **D5** decides whether that is acceptable per dispatch.
 
@@ -533,21 +548,27 @@ direction); no claim that a held process survives arbitrary delay.
 > code**. That assertion is withdrawn: it is not established, and it was stated more
 > firmly than the evidence supports.
 >
-> Further changes to the common preparation code **may** be required, and whether they are
-> depends on two things this design has not settled: the **binding** between the process
-> that was verified and the process that actually receives the task, and the **lifetime**
-> of that binding across the interval between verification and delivery. Today preparation
-> calls `verify_model_identity(...)` for each role, holds no process and assumes no
-> liveness — so if D8 chooses the held-process shape, preparation would have to carry a
-> process handle (or a binding to one) from the verification through to delivery, which is
-> a process-ownership and cleanup contract it does not have. If instead D8 chooses
-> re-entry, the re-entry is `--resume`, which inherits the last selection silently and
-> needs its own re-verification at the delivery target; where that re-verification is
-> placed may also touch preparation.
+> Further changes to the common preparation code **are** required, and the two things they
+> depend on are **settled**: **D8 was approved on 2026-11-01** and fixed both the **binding**
+> between the process that was verified and the process that actually receives the task, and
+> the **lifetime** of that binding across the interval between verification and delivery.
+> The approved answers are the **non-interactive hosted target** (D8-a) and the
+> **round-scoped** lifetime (D8-b, §3a.12.1 **TL**) — **not** the `--resume` re-entry shape.
+> Preparation therefore does carry a binding from verification through to delivery, with the
+> process-ownership and cleanup contract spelled out in §3a.3 and §3a.12.1, and its lease /
+> bind / release half is **implemented** as **I-1 / I-4 / I-7**.
 >
-> **This is to be settled under D8 (§5), not here.** Nothing in this retraction implements
-> a driver, changes a standalone switch, or makes a preparation change: it records that the
-> question is open and that the earlier "no change needed" statement is not a finding.
+> *(Superseded 2026-11-01: this paragraph read "depends on two things this design has not
+> settled", "so if D8 chooses the held-process shape, preparation would have to carry a
+> process handle", "If instead D8 chooses re-entry", and "**This is to be settled under D8
+> (§5), not here.**" All of that was written before the decision and is retained here only
+> as the history of the retraction.)*
+>
+> **What the retraction itself still says, unchanged:** nothing in it implements a driver,
+> changes a standalone switch or makes a preparation change, and the earlier "no change
+> needed" statement was not a finding. The questions it raised are now **answered by D8's
+> approval**, and the remaining gap is **implementation** — I-5, I-6 and I-8 are not
+> started.
 
 **Alternatives and cost:** (B) is cheapest and already exists, but cannot satisfy the barrier
 at all — it is the right choice only if the answer to OS-14 is "do not verify", which the
@@ -584,8 +605,10 @@ question:
 
 What remains is §3's candidate (A): **one attempt → a dedicated non-interactive Claude
 process → preflight turn → observe/verify that turn → deliver the real task into the SAME
-target → collect/settle/terminate.** It is still a **candidate, not an approved contract**
-(D8, 승인 대기). This section states what it costs to make it true on the existing adapter.
+target → collect/settle/terminate.** The **contract is APPROVED (D8, 2026-11-01)**; what is
+still absent is its **implementation** — I-5's shim, I-6's driver and I-8's delivery branch are
+**not started**, so the sequence below is not yet what the code does. This section states what
+it costs to make it true on the existing adapter.
 
 ### 3a.1 The identity anchor already exists, and it is the Orca terminal handle
 
@@ -762,7 +785,9 @@ Three facts in that order matter more than the rest and are easy to miss:
   and calling it a request would attest an act that did not occur** — which is a weaker
   contract than today's, not a stronger one. §6 D2 states the two ways out and
   recommends one; the step marked `[NEW, D2 option B]` above is the recommended one, and
-  **it is 승인 대기, so the sequence above is a proposal and not the current code**.
+  **it is APPROVED (2026-11-01)**. Its lease half is now **implemented** (I-1 / I-4), and the
+  steps that depend on I-3, I-5, I-6 or I-8 are **still a proposal and not the current code**
+  — the per-unit table in the top status block says which is which.
 - **The Task does not exist when the pre-pass verifies.** Step 4f runs at step 4, step 5
   creates the Task. That is why `verify_model_identity` is called with `task_id=""`
   (`orca_adapter.py:599`) — and therefore why the pre-pass's attested key is
@@ -891,8 +916,8 @@ never reached; and the held-process question is measured only to **68.8 s**.
 | Depends on 미검증 Orca behaviour | **U-3 + U-5.** Corrected: U-2 is now **measured** (S-0, byte-exact + one CR), so byte-exactness is no longer (C-1)'s blocker — **U-3 is**, because `start_worker` calls `worker-start --terminal` unconditionally and raises on any receipt that is neither ready nor `agent_unconfigured` (`:4707-4768`) | **U-5 only — and ONLY with §3a.13's hosted branch.** Without that branch, (C-2) still traverses **U-3** for the same reason, because rung 4 is never reached; replacing the rung-4 `terminal send` alone does not help. U-1's supervisor half is now **observed** (S-1b), but §3a.12's own channel and bootstrap are **unexecuted**, which is a different and larger gap than a 미검증 Orca call | **U-3 + U-4** |
 | New code | none beyond the driver | driver **+ one shim** + the hosted delivery branch (§3a.13) + the launch lease (§6 D2 option B) | none beyond the driver |
 
-**Recommendation: (C-2), 승인 대기 under D8 — unchanged by the feasibility run, for a
-narrower reason than before.** The reason is not elegance, it is evidence discipline:
+**Recommendation: (C-2) — APPROVED under D8-a (2026-11-01), and unchanged by the feasibility
+run, for a narrower reason than before.** The reason is not elegance, it is evidence discipline:
 (C-2) is the only coupling whose *evidence* path and *delivery* path depend on no
 **undocumented Orca behaviour**. The terminal still **hosts and owns** the process, so the
 handle, the digest, the reuse gate, the durable record, the Task, the Dispatch,
@@ -969,10 +994,10 @@ experiment's allow-list becomes a product default:
 |---|---|---|
 | argv | `--safe-mode --setting-sources '' --no-session-persistence --permission-prompts none --allowedTools "Bash(orca --version)" "Bash(orca orchestration send:*)"` | at minimum the lifecycle commands above **plus** whatever a development Worker/Reviewer genuinely needs: reading files, editing files, and running this repository's tests |
 | what it was enough for | exactly two harmless commands, in one turn, in a probe that changed no file | unknown — no measurement covers it |
-| `--permission-mode` | **not used at all**; `permissionMode` reported `default` | undecided. The narrow recommendation stays: take `permission_mode` from the **agent profile** (as the standalone driver already does — `standalone_drivers.py` `profile.permission_mode`) rather than hard-coding one in the driver |
+| `--permission-mode` | **not used at all**; `permissionMode` reported `default` | part of the **PENDING** product permission scope. The narrow recommendation stays: take `permission_mode` from the **agent profile** (as the standalone driver already does — `standalone_drivers.py` `profile.permission_mode`) rather than hard-coding one in the driver |
 | `bypassPermissions` / `--dangerously-skip-permissions` | **not used, and not proposed** | **not proposed.** A blanket mode would make the allow-list decorative |
 | auth | personal OAuth only; no API key, no credential copying | unchanged by this document; the company environment is §7 |
-| status | an **observation about one probe**, recorded so it is not mistaken for a policy | **승인 대기**, with D8's security half |
+| status | an **observation about one probe**, recorded so it is not mistaken for a policy | **승인 대기 (PENDING)** — the product permission scope, the one item still awaiting the user. Written up as an unexecuted proposal in `docs/OS-14-permission-scope-proposal.md` |
 
 **Sufficiency for one harmless probe is not a product policy, and this document does not
 propose it as one.** The product scope is the user's decision, and it is the one half of D8
@@ -1078,8 +1103,12 @@ the barrier's whole purpose.
 
 ### 3a.11 The preparation and delivery changes the recommended shape needs
 
-This is the concrete content of the §3 RETRACTION, and of §5's D8 row. All of it is
-**승인 대기**.
+This is the concrete content of the §3 RETRACTION, and of §5's D8 row. The **decisions**
+behind all of it — D2 and D8-a..d — are **APPROVED (2026-11-01)**. The **implementation** is
+partial and the two must not be read off each other: P-2, P-3, P-6 and P-8 are implemented
+(I-1, I-2, I-4, I-7), while **P-1 (I-3), P-4 (I-8) and P-5 (I-5/I-6) are not started** and
+P-7's three vocabulary members are deliberately deferred to I-10. The per-unit table in the
+top status block is the authority on each.
 
 | # | Change | Where | Why it cannot be avoided under (C-2) |
 |---|---|---|---|
@@ -1090,7 +1119,7 @@ This is the concrete content of the §3 RETRACTION, and of §5's D8 row. All of 
 | **P-5** | the pre-pass and Gate B must be **two turns on one process** — and exactly **one** launch | driver-local only | measured feasible (P1 M3). It is a cost, not a change: **two preflight turns per delivered attempt**, plus one per counterpart role per round. The user's own constraint forbids the alternative: the two verification calls of one attempt must not create duplicate processes nor swap the verified session |
 | **P-6** | the driver must declare **hosted delivery** as a capability, through **one** derivation — **the rule HC below**, which is the single definition this document uses everywhere | `agent_profile.model_selection_capabilities`'s sibling (`scripts/agent_profile.py:1339-1363`), same shape as the existing one-rule function | **the two call sites that must not be able to disagree — and neither of them is recognition.** HC is read at the **preparation gate** `bind_prepared_target` (step 4d, P-8) and at §3a.13's **deliverability** condition **D-a** (step 8), by the **same** function over the **same** driver object. **Recognition is not keyed on capability:** §3a.13 Stage 1 recognises a hosted target on the durable **hosted launch cell alone** (R-1), and an absent or incomplete HC on a **cell-bearing** target is the named refusal **`HOSTED_TARGET_UNDELIVERABLE`** with cause **`HOSTED_CAPABILITY_INCOMPLETE`** — **never** a demotion to the legacy `worker-start` / `terminal send` path. When HC does **not** hold, the preparation gate mints **no** hosted launch cell at all, so the sessions it prepares are **genuinely legacy** and take today's path by **R-1 false**, with Gate B and every existing check unchanged. A delivery branch keyed on anything the harness does not itself derive would let the declaration gate and the delivery path disagree, which is the defect `model_selection_capabilities` exists to prevent — and in the earlier edition they **did** disagree (DR-02's C-1: §3a.13 said one name, P-6/P-8/§6 D8/§9.1 I-2 all said two) |
 | **P-8** | the **post-create bind** must be a statement of the preparation sequence, immediately after the `CREATED` write: one harness method `bind_prepared_target(handle, role, phase, attempt)` beside `verify_model_identity`, and **one** call to it from `_prepare_role` | `orca_runtime_harness.py` (the method; it checks the lease, re-derives `pause_policy.terminal_digest(handle)`, and calls `driver.bind_target` **only** when the hosted capability is derived) + `orca_adapter.py:862-864` (the call, right after the `CREATED` record) | the handle does not exist before `terminal create` returns (`orca_runtime_harness.py:2996`) and its digest is recorded only at `CREATED`, so **no** shim-authored frame can carry either (review F-003). The bind is the only non-circular way the running shim learns which Orca terminal it is: the harness holds the create receipt, the shim echoes. It is **one** call and **no new refusal branch** — a failed bind leaves the target unbound and 4f's existing unconditional verification refuses it through `PAIR_PREPARATION_MODEL_UNOBSERVED` (`orca_adapter.py:606-617`). The capability is derived by the **same** rule as P-6 (both `deliver_hosted` and `bind_target` callable), so a driver that can deliver but cannot bind is not hosted-capable |
-| **P-7** | the two **request-method members** and the **observation member** must be added, and the launch leg's two new attested fields (`launch_token`, `launch_stamp`) added to `ModelEvidence` | `orca_runtime_harness.py:844`, `:872`, `:1009-1019` + mirror + `scripts/test_os49_vocabulary_locks.py` | §6 D1/D2. Additive fields with `""`/`0` defaults, so every existing construction binds unchanged — the same pattern `ReuseObservation` and `RuntimeAttempt` already use. **Last**, after D2 |
+| **P-7** | the two **request-method members** and the **observation member** must be added, and the launch leg's two new attested fields (`launch_token`, `launch_stamp`) added to `ModelEvidence` | `orca_runtime_harness.py:844`, `:872`, `:1009-1019` + mirror + `scripts/test_os49_vocabulary_locks.py` | §6 D1/D2. Additive fields with `""`/`0` defaults, so every existing construction binds unchanged — the same pattern `ReuseObservation` and `RuntimeAttempt` already use. **Last in IMPLEMENTATION ORDER**, after the D2-dependent units — an ordering choice, not a wait for approval (D2 is **APPROVED 2026-11-01**). *(Superseded 2026-11-01: this cell read "**Last**, after D2".)* The two attested FIELDS are implemented; the three MEMBERS are deliberately deferred to I-10 |
 
 > **HC — the hosted-capability rule, defined once, here.** The hosted-delivery capability
 > exists **iff** `deliver_hosted` **and** `bind_target` are **both** callable on the driver
@@ -1572,7 +1601,8 @@ hosted session in flight, and the operator sees two live terminals the engine wi
 reuse. The alternative — a **re-bind** by the successor, with peer credentials plus
 `argv_digest` plus a fresh preflight turn — is strictly more code, needs the lease-exercise
 rule relaxed across processes, and needs the peer-credential observation above first; it is
-recommended **later, not first**, and it is part of D8's pending scope. Note what such a
+recommended **later, not first**, and it is inside D8's approved scope but deliberately not
+part of the first implementation. Note what such a
 successor would face: the binding is driver-local in-memory state (O6), so there is nothing
 durable for it to read, and a re-bind would be a **new** bootstrap against a child that is
 already running — the one case the spawn-after-bind rule cannot cover.
@@ -2113,12 +2143,30 @@ takes.
 | Coupled decision | The exact code boundary | Alternative that keeps the common work independent |
 |---|---|---|
 | **D2** — what is this attempt's model request, when the prepared session outlives the attempt? | the single `create_fake_terminal(...)` call inside the adapter's preparation step, where a model-pinned launch would have to replace a model-neutral one. Note `create_fake_terminal` records `requested_model` as a **separate** ledger field and never concatenates a model into `--command` (`orca_runtime_harness.py:2926-3009`) — **and** that the locked contract value `AGENT_PROFILE_MODEL_SELECTION = declared_driver_capability_only_never_launch_argument` (`scripts/validate_skills.py:938-940`) currently forbids the model being a launch argument at all | **(taken)** keep preparation model-**neutral** and let the driver make its request against the session preparation created. Needs no D2. The alternative — D2 option B's **launch lease**, minted before `terminal create` — also changes the reuse gate's condition-2 key unless condition 2 keeps reading the **profile** command, and it replaces that locked contract value, at a cost of one new seam, one schema bump and one contract-lock edit |
-| **D8** — execution lifetime | the `verify_model_identity(...)` call inside preparation, and whether the **same** process must then run the task | **(taken, for the reference driver only)** one self-contained driver call per role: preparation holds no process and assumes no liveness. The alternative — preparation hands the driver a process it must keep alive until delivery — gives preparation a process-ownership and cleanup contract it does not have today. **OS-14 correction run:** the earlier claim that the held `claude -p` path (§3, option (A)) attaches with no change to this code is **retracted**. Whether a change is needed depends on the **binding** between the verified process and the actual task recipient and on the **lifetime** of that binding. **Settled as a recommendation in §3a** (and §3a.11 names the eight concrete preparation/delivery changes, P-1…P-8); the **decision** remains D8's, 승인 대기 — not asserted in §3 |
+| **D8** — execution lifetime | the `verify_model_identity(...)` call inside preparation, and whether the **same** process must then run the task | **(taken, for the reference driver only)** one self-contained driver call per role: preparation holds no process and assumes no liveness. The alternative — preparation hands the driver a process it must keep alive until delivery — gives preparation a process-ownership and cleanup contract it does not have today. **OS-14 correction run:** the earlier claim that the held `claude -p` path (§3, option (A)) attaches with no change to this code is **retracted**. Whether a change is needed depends on the **binding** between the verified process and the actual task recipient and on the **lifetime** of that binding. **Settled as a recommendation in §3a** (and §3a.11 names the eight concrete preparation/delivery changes, P-1…P-8); the **decision** is D8's and is **승인됨 — APPROVED 2026-11-01** — it was never asserted in §3 |
 | **Proof-grade re-adoption of a prepared session across processes** | `pause_policy.resolve_prepared_terminal` and the prepared entry's `terminal_digest` | **(taken)** digest-proved adoption plus **mandatory re-verification** on every pass. A real driver may additionally need a **session-liveness** proof — is the agent process behind this terminal still the one that was verified? — which the durable record deliberately does **not** claim |
 
 ---
 
-## 6. Still-undecided items — the D1–D8 decision table
+## 6. The D1–D8 decision table — **D2, D3, D5 and D8-a..d APPROVED 2026-11-01; only the product permission scope is PENDING**
+
+> **STATUS, 2026-11-01 — this section is no longer a list of undecided items.** The user
+> approved **D2, D3, D5 and D8-a / D8-b / D8-c / D8-d** for the **local first
+> implementation** (Jira OS-14 comment 10101); the top status block of this document records
+> the same scope and what each approval does **not** grant. **D1** was always downstream of
+> D2 and is an implementation decision, not a permission request. The **only** item still
+> awaiting the user is the **product permission scope**, whose written — and deliberately
+> **unexecuted** — proposal is `docs/OS-14-permission-scope-proposal.md`.
+>
+> **An approval is not an implementation.** Each unit's implementation state is tracked
+> separately, in the per-unit I-1…I-11 table in the top status block, and the two must not be
+> read off each other: D8-b is approved and I-7 is implemented, while D8-a is approved and
+> I-5 / I-6 / I-8 are **not started**.
+>
+> Every "승인 대기" marker that applied to D2 / D3 / D5 / D8 in the earlier edition of this
+> section is **superseded as of 2026-11-01** and has been replaced in place below. Where a
+> paragraph describes what the decision WOULD cost or change, that text is kept because it is
+> still the decision's content — only its status has moved.
 
 Each is stated as a decision with a recommendation, not as a bare permission request. **None
 of them blocks the common pair-preparation work**, which is merged and runs the reference
@@ -2126,20 +2174,22 @@ driver. Every item below carries the same seven fields — **추천안 / 근거 
 변경 범위 / 대안·비용 / 추가 관측 / 사용자 승인 필요 여부** — so the set can be decided in
 one pass. The numbers and meanings are unchanged from the earlier edition of this document.
 
-**Neither a DESIGN PASS nor the publication of a design PR is a user approval of any item
-below.** Items marked **승인 대기** stay pending until the user decides them explicitly.
+**Neither a DESIGN PASS nor the publication of a design PR was the approval recorded above.**
+The 2026-11-01 approval was given by the user explicitly, for the scope the status block
+states. The one item still marked **승인 대기 (PENDING)** — the product permission scope —
+stays pending until the user decides it explicitly.
 
 | # | Subject | 추천안 (one line) | 승인 필요? |
 |---|---|---|---|
 | **D1** | request/observation vocabulary names | add `cli_launch_model_flag` **and** `cli_launch_lease_revalidation` (request) + `stream_json_preflight_assistant` (observation) as **named** members | downstream of D2 — implementation decision |
-| **D2** | what is **this attempt's** request, when the session outlives the attempt? | **a launch-scoped request, minted and durably bound before the terminal exists, revalidated — never re-pretended — by every later call** (option B) | **YES — 승인 대기. Blocking.** Changes one locked contract value |
-| **D3** | the trust standard for the model observation | the four-part conjunction **plus `exact_equality.v1`**: fully qualified model ids only, aliases refused without spending a turn | **YES — 승인 대기** (contract) |
+| **D2** | what is **this attempt's** request, when the session outlives the attempt? | **a launch-scoped request, minted and durably bound before the terminal exists, revalidated — never re-pretended — by every later call** (option B) | **승인됨 — APPROVED 2026-11-01** for the local first implementation (Jira OS-14 comment 10101). Changes one locked contract value, which **I-3** has **not** yet made |
+| **D3** | the trust standard for the model observation | the four-part conjunction **plus `exact_equality.v1`**: fully qualified model ids only, aliases refused without spending a turn | **승인됨 — APPROVED 2026-11-01** (contract). Alias / gateway-alias stay unsupported, and the verdict is **CLI-reported**, never an independent proof of the model a server ran |
 | **D4** | where the ordinals are drawn | `launch_stamp` once per lease, immediately before `terminal create`; leg 1 immediately before the preflight input; leg 2 immediately after the `result` passes all four checks | implementation decision |
-| **D5** | verification cost and validity window | re-verify **every dispatch**; same-attempt re-calls are separate verifications on **one** process | **YES — 승인 대기** (operational cost) |
+| **D5** | verification cost and validity window | re-verify **every dispatch**; same-attempt re-calls are separate verifications on **one** process | **승인됨 — APPROVED 2026-11-01** (operational cost). **Not** a billing or latency guarantee and **not** an unlimited model-call budget |
 | **D6** | failure mapping | map every measured failure onto the **existing** closed vocabulary; add **no** member | implementation decision |
 | **D7** | Orca's own `worker-start --model` | **out of the first scope**; 문서상 지원 only, unexecuted | scope decision, not blocking |
-| **D8** | execution target and lifetime | **one dedicated non-interactive process per prepared session, hosted by the Orca terminal, controlled through an `AF_UNIX` channel owned by a supervisor shim (§3a.12), delivered through the hosted branch of `start_worker` (§3a.13)**, with the target/channel/lease held for the whole gate **ROUND** (§3a.12 **TL**) and a **three-way** delivery verdict in which **UNKNOWN is irreducible** (§3a.13.1) | **YES — 승인 대기. Blocking.** Four separable sub-decisions: **D8-a** target, **D8-b** round lifetime, **D8-c** delivery verdict, **D8-d** termination responsibility |
-| **permission** | what a dispatched `-p` process may execute | **separate the two**: the **experimental** allow-list that sufficed for one harmless probe is an *observation*, not a policy; the **product** scope for a driver that must read, edit and test code is not written yet (§3a.7) | **YES — 승인 대기, both halves, independently.** Neither is approved by approving D8-a |
+| **D8** | execution target and lifetime | **one dedicated non-interactive process per prepared session, hosted by the Orca terminal, controlled through an `AF_UNIX` channel owned by a supervisor shim (§3a.12), delivered through the hosted branch of `start_worker` (§3a.13)**, with the target/channel/lease held for the whole gate **ROUND** (§3a.12 **TL**) and a **three-way** delivery verdict in which **UNKNOWN is irreducible** (§3a.13.1) | **승인됨 — APPROVED 2026-11-01**, all four sub-decisions: **D8-a** target, **D8-b** round lifetime, **D8-c** delivery verdict, **D8-d** termination responsibility. Implementation state is separate: **I-7** (D8-b) is implemented; **I-5 / I-6 / I-8** are not started |
+| **permission** | what a dispatched `-p` process may execute | **separate the two**: the **experimental** allow-list that sufficed for one harmless probe is an *observation*, not a policy; the **product** scope for a driver that must read, edit and test code is now **written up as an unexecuted proposal** in `docs/OS-14-permission-scope-proposal.md` (§3a.7) | **승인 대기 (PENDING) — the ONE item still awaiting the user.** The experimental allow-list is an *observation* and is **not** proposed as a product default; the product scope is written but **not approved and not executed**. Approving D8-a did **not** approve it |
 
 ### D1 — the vocabulary member names
 
@@ -2176,7 +2226,7 @@ below.** Items marked **승인 대기** stay pending until the user decides them
   **downstream of D2**. It must not be merged ahead of D2, because the member's existence is
   what would make the ineligible path look eligible.
 
-### D2 — what is **this attempt's** model request, when the session outlives the attempt? **(blocking)**
+### D2 — what is **this attempt's** model request, when the session outlives the attempt? — **승인됨 — APPROVED 2026-11-01**
 
 **The problem, restated after review F-001 (the earlier edition of this item got it
 wrong).** The contract wants, per driver call, one attested **request** and one attested
@@ -2378,12 +2428,12 @@ verified evidence.
   stream-json` accepts a per-message model field at all (미검증). It is **not** worth a turn
   from this run's remaining budget, because a positive result would still leave (A) needing
   a second launch for the *process*-scoped flags, and a negative result changes nothing.
-- **사용자 승인 필요 여부:** **YES. 승인 대기.** It changes the OS-49 per-attempt request
+- **사용자 승인 필요 여부:** **승인됨 — APPROVED 2026-11-01** for the local first implementation (Jira OS-14 comment 10101). It changes the OS-49 per-attempt request
   contract and one locked contract value. **Required before any real-driver work starts, and
   before D1's members are added.**
 
 
-### D3 — the independence standard for leg 2
+### D3 — the independence standard for leg 2 — **승인됨 — APPROVED 2026-11-01**
 
 - **추천안:** `verified` requires **all four** conjuncts below, for the **preflight turn**,
   and nothing less. Each is stated as the exact comparison a driver must perform:
@@ -2509,7 +2559,7 @@ verified evidence.
   (anything other than the turn being verified) if `exact_equality.v1` is ever to be widened.
   **None of the three is spent from this run's budget**, and none of them is needed for the
   recommendation above, which is deliberately the option that needs no new observation.
-- **사용자 승인 필요 여부:** **YES — 승인 대기.** It is the contract that defines what
+- **사용자 승인 필요 여부:** **승인됨 — APPROVED 2026-11-01**. It is the contract that defines what
   `verified` means for a real provider, and it is decided **with D2**.
 
 ### D4 — where the two ordinals are drawn
@@ -2560,7 +2610,7 @@ verified evidence.
 - **추가 관측:** none.
 - **사용자 승인 필요 여부:** **no** — implementation decision.
 
-### D5 — verification cost and validity window
+### D5 — verification cost and validity window — **승인됨 — APPROVED 2026-11-01**
 
 - **추천안:** **re-verify every dispatch, and accept the cost.** Explicitly distinguish the
   two re-verification kinds, because they are different acts with different costs:
@@ -2666,7 +2716,7 @@ verified evidence.
 - **추가 관측:** the **hold-duration** question — does a held process survive a real Worker
   turn's worth of waiting? 90 s is measured; a p95-length hold is not (§3a.8). One turn plus
   one long wait, after a real p95 figure exists.
-- **사용자 승인 필요 여부:** **YES — 승인 대기**, because it is a recurring cost per dispatch
+- **사용자 승인 필요 여부:** **승인됨 — APPROVED 2026-11-01**. It is a recurring cost per dispatch
   and the user owns that trade-off. It is not blocking for *design*; it is blocking for
   *operation*.
 
@@ -2754,9 +2804,23 @@ verified evidence.
   holds; plus one attempt combining `--model` with `--terminal` to confirm the documented
   refusal is a refusal.
 - **사용자 승인 필요 여부:** **no** for keeping it out of scope (that is the recommendation
-  and the status quo). **YES — 승인 대기** to make it the primary path.
+  and the status quo). Making it the **primary path** is **NOT APPROVED** and is **not part of
+  the 2026-11-01 approval** — it remains a **separate future decision**, and one that cannot
+  be taken before the execution verification this item's 추가 관측 names, because the flag's
+  behaviour is still **문서상 지원 and unexecuted**. **D8-a's C-2 hosted non-interactive target
+  is the only approved primary target for this local scope**, and Orca's own
+  `worker-start --model` is documented as incompatible with the `--terminal` delivery every
+  protection here is built on.
 
-### D8 — execution target and lifetime **(blocking; required before real-driver work)**
+  > *(Erroneous edit, introduced and removed on 2026-11-01: an intermediate revision of this
+  > line read "**승인됨 — APPROVED 2026-11-01** as the primary path". That was wrong on its
+  > face — D7 was never part of the 2026-11-01 approval, which granted D2, D3, D5 and
+  > D8-a..d only — and it contradicted D8-a, §6's own table row (which still reads "out of
+  > the first scope"), §8 (only `--help` was read) and §9.4 (no `worker-start --model`
+  > execution occurred). It is recorded here as a corrected error, not as history of a
+  > decision.)*
+
+### D8 — execution target and lifetime — **승인됨 — APPROVED 2026-11-01** (all four sub-decisions)
 
 - **추천안 — ONE path:** **a dedicated non-interactive `claude -p --input-format stream-json`
   process per prepared session, hosted by the Orca terminal that preparation creates, and
@@ -2776,10 +2840,10 @@ verified evidence.
 
   | # | What is being decided | Where it is specified | Status |
   |---|---|---|---|
-  | **D8-a** | **the execution target**: coupling (C-2) — one `claude -p` process per prepared session, hosted by the Orca terminal whose own process is the repo-owned supervisor shim, controlled through the shim's `AF_UNIX` channel, delivered through the hosted branch above `worker-start`, admitted by **recognition on the durable hosted launch cell alone** with **HC** and the lease/channel as **deliverability** requirements whose failure is a **named refusal** (§3a.13) | §3a.6, §3a.11 HC, §3a.12, §3a.13 | **승인 대기.** The shape is supported by S-1a (direct hosting refuted) and S-1b/S-3 (a supervisor-hosted process received a task and settled its own Dispatch), but §3a.12's **own** channel, bootstrap and lease are **unexecuted** |
-  | **D8-b** | **the round lifetime**: the target, channel and lease are held for the whole gate ROUND and released at round close, where "close" is the ONE predicate of **§3a.12.1 TL**: **(1a)** every role **REQUIRED by the round at the run's risk level** is `VALIDATED` — HIGH/MEDIUM the Worker **and** the phase Reviewer, counting a **prepared-but-not-yet-dispatched** Reviewer as required; LOW the Worker only — **and (1b)** ROUTE's token is neither `PREPARE_REPAIR` nor `PREPARE_PHASE_REVIEWER`. Never bare `settle_attempt`, and never "every role *dispatched* so far", which would close a HIGH-risk round after the accepted Worker turn. TL's four per-role states and its 15-row hold/dispose table are **derived** from that predicate and covering Worker repair, phase-Reviewer repair, repair success, repair exhaustion, SEMANTIC/LIFECYCLE block, Reviewer FAIL, PASS, BLOCKED, ESCALATED, cancel/abandon, PAUSE, a step-4 refusal and process exit | §3a.12.1 TL, §3a.8 | **승인 대기.** Required for the normal Worker→Reviewer flow to work at all (DR-01, measured X-3) **and** for a validation repair of either role to be able to run at all (현행 코드: the engine classifies a gate defect one node **after** settlement and re-dispatches the same role under the same key). Costs one preflight turn per round on a post-task session, `+3 preflight + 1 real` per repair attempt (bounded by `MAX_REPAIR_ATTEMPTS = 2` per role), and a two-process hold whose duration is **미검증** beyond 90 s / 68.8 s |
-  | **D8-c** | **the delivery verdict**: three-way `delivered` / `not_delivered` / **UNKNOWN**, with UNKNOWN **irreducible**, no auto-resend, no success settlement, no second target, and the existing Dispatch obligation kept | §3a.13.1 | **승인 대기.** Measured (X-5). This is an acceptance of a **permanent operational residue**: some deliveries end in a state nobody can resolve automatically, and the design chooses to report that rather than guess |
-  | **D8-d** | **termination responsibility**: nothing in this engine terminates a hosted CLI child. The shim does **not** kill its child when the channel goes away; `release(handle)` tears down the channel and the lease only; the **operator** closes terminals through the existing residual-session procedure; and Orca revokes the **dispatch capability** itself at settlement (실제 관측, S-3) | §3a.3, §3a.12, §3a.12.1 | **승인 대기.** The cost is explicit: after a refusal, a restart or a Coordinator exit, the CLI child stays alive until the operator closes the terminal. That is the existing contract for every Orca terminal this engine creates, not a new leak class — but under TL it now also applies to a **settled** role's process |
+  | **D8-a** | **the execution target**: coupling (C-2) — one `claude -p` process per prepared session, hosted by the Orca terminal whose own process is the repo-owned supervisor shim, controlled through the shim's `AF_UNIX` channel, delivered through the hosted branch above `worker-start`, admitted by **recognition on the durable hosted launch cell alone** with **HC** and the lease/channel as **deliverability** requirements whose failure is a **named refusal** (§3a.13) | §3a.6, §3a.11 HC, §3a.12, §3a.13 | **승인됨 — APPROVED 2026-11-01**. The shape is supported by S-1a (direct hosting refuted) and S-1b/S-3 (a supervisor-hosted process received a task and settled its own Dispatch), but §3a.12's **own** channel, bootstrap and lease are **unexecuted** |
+  | **D8-b** | **the round lifetime**: the target, channel and lease are held for the whole gate ROUND and released at round close, where "close" is the ONE predicate of **§3a.12.1 TL**: **(1a)** every role **REQUIRED by the round at the run's risk level** is `VALIDATED` — HIGH/MEDIUM the Worker **and** the phase Reviewer, counting a **prepared-but-not-yet-dispatched** Reviewer as required; LOW the Worker only — **and (1b)** ROUTE's token is neither `PREPARE_REPAIR` nor `PREPARE_PHASE_REVIEWER`. Never bare `settle_attempt`, and never "every role *dispatched* so far", which would close a HIGH-risk round after the accepted Worker turn. TL's four per-role states and its 15-row hold/dispose table are **derived** from that predicate and covering Worker repair, phase-Reviewer repair, repair success, repair exhaustion, SEMANTIC/LIFECYCLE block, Reviewer FAIL, PASS, BLOCKED, ESCALATED, cancel/abandon, PAUSE, a step-4 refusal and process exit | §3a.12.1 TL, §3a.8 | **승인됨 — APPROVED 2026-11-01**, and **implemented** as I-7 including its engine connection. Required for the normal Worker→Reviewer flow to work at all (DR-01, measured X-3) **and** for a validation repair of either role to be able to run at all (현행 코드: the engine classifies a gate defect one node **after** settlement and re-dispatches the same role under the same key). Costs one preflight turn per round on a post-task session, `+3 preflight + 1 real` per repair attempt (bounded by `MAX_REPAIR_ATTEMPTS = 2` per role), and a two-process hold whose duration is **미검증** beyond 90 s / 68.8 s |
+  | **D8-c** | **the delivery verdict**: three-way `delivered` / `not_delivered` / **UNKNOWN**, with UNKNOWN **irreducible**, no auto-resend, no success settlement, no second target, and the existing Dispatch obligation kept | §3a.13.1 | **승인됨 — APPROVED 2026-11-01**. Measured (X-5). This is an acceptance of a **permanent operational residue**: some deliveries end in a state nobody can resolve automatically, and the design chooses to report that rather than guess |
+  | **D8-d** | **termination responsibility**: nothing in this engine terminates a hosted CLI child. The shim does **not** kill its child when the channel goes away; `release(handle)` tears down the channel and the lease only; the **operator** closes terminals through the existing residual-session procedure; and Orca revokes the **dispatch capability** itself at settlement (실제 관측, S-3) | §3a.3, §3a.12, §3a.12.1 | **승인됨 — APPROVED 2026-11-01**. The cost is explicit: after a refusal, a restart or a Coordinator exit, the CLI child stays alive until the operator closes the terminal. That is the existing contract for every Orca terminal this engine creates, not a new leak class — but under TL it now also applies to a **settled** role's process |
 
   The scope limit is stated in the driver's own docstring: **every measurement behind this
   recommendation is `claude -p`.** Orca operates long-lived terminal sessions, and
@@ -2884,7 +2948,7 @@ verified evidence.
      longer on the critical path;
   4. **U-5** (`terminal read` fidelity, operator-facing only) and **U-4** (`--inject` /
      `--return-preamble`), neither of which the recommended shape uses.
-- **사용자 승인 필요 여부:** **YES. 승인 대기. Required before real-driver work starts** —
+- **사용자 승인 필요 여부:** **승인됨 — APPROVED 2026-11-01**, all four sub-decisions. **Was required before real-driver work could start, and is now given** —
   it is the scope decision that determines whether §3a.11's common-code changes happen at
   all.
 
@@ -2913,7 +2977,10 @@ The side-by-side table is in **§3a.7** and is not restated here.
      probe's two harmless commands, with no refusal, `permissionMode = "default"` and
      `apiKeySource = "none"` (실제 관측, S-3). **Recorded, and not proposed as a product
      policy.**
-  2. **the product scope is unwritten and is what needs deciding.** A real Worker or Reviewer
+  2. **the product scope is written and is what needs DECIDING** — the written-up, explicitly
+     **unexecuted** proposal is `docs/OS-14-permission-scope-proposal.md`, and it is the one
+     item of this document still **승인 대기 (PENDING)**. *(Superseded 2026-11-01: this item
+     previously said the product scope was unwritten.)* A real Worker or Reviewer
      must read files, edit files and run this repository's tests, which the two-command
      allow-list cannot express. The recommendation for *how* to express it is unchanged:
      take `permission_mode` from the **agent profile** (as `standalone_drivers.py` already
@@ -2942,9 +3009,11 @@ The side-by-side table is in **§3a.7** and is not restated here.
 - **추가 관측:** one fixture turn under a candidate **product** scope, doing one real file edit
   and one real test invocation, to confirm it is expressible in argv and that nothing prompts.
   Cheap, and **not** spent here.
-- **사용자 승인 필요 여부:** **YES — 승인 대기, for item 2.** Item 1 needs no approval because
-  it is a record of what already happened, and it is recorded precisely so that it is not
-  mistaken for item 2.
+- **사용자 승인 필요 여부:** **승인 대기 (PENDING), for item 2** — the **only** item in this
+  document still awaiting the user as of 2026-11-01. Item 1 needs no approval because it is a
+  record of what already happened, and it is recorded precisely so that it is not mistaken for
+  item 2. The written proposal for item 2 is `docs/OS-14-permission-scope-proposal.md`;
+  **nothing in it is executed, configured or enabled.**
 
 ### The in-session `/model` enablement action the user would have to take
 
@@ -2988,9 +3057,11 @@ model call appears through a gateway.
 - It does **not** claim anything about the company environment.
 - It does **not** treat the reference (fake) driver's success as evidence about any provider's
   model: its observation leg re-reads the value its own request leg stored.
-- It does **not** decide D1–D8. Items marked **승인 대기** are the user's, and neither a
-  DESIGN PASS nor the publication of a design PR is recorded as a user approval of any of
-  them.
+- It does **not** itself decide D1–D8, and it never did: a DESIGN PASS and the publication of
+  a design PR are **not** user approvals. **What decided them was the user, on 2026-11-01**
+  (Jira OS-14 comment 10101), for D2 / D3 / D5 / D8-a..d and for the **local first
+  implementation** only — recorded in the top status block and in §6. The one item still
+  marked **승인 대기 (PENDING)** is the **product permission scope**.
 - **§3a does not claim that the Orca-side link works as a whole.** Of the six boundaries,
   **U-1 (supervisor half), U-2 and U-6 are now 실제 관측**, U-1's *direct* half is **반증**,
   and **U-3, U-4 and U-5 remain 미검증** — U-3 documented-**adverse**. The recommended coupling
@@ -3037,12 +3108,21 @@ model call appears through a gateway.
   capability-false class had no launch lease, so the probe's own `split_v2` candidate carries
   the same hole and never showed it. What **is** measured (X-4) is the channel-loss and
   revoked-lease classes.
-- **It does not propose a product permission policy.** The scope that sufficed for one harmless
-  probe is recorded as an observation; the product scope is **승인 대기** and unwritten (§3a.7,
-  §6 Permission scope).
-- It does **not** record approval for the two contract changes the recommendation needs: the
-  replaced `AGENT_PROFILE_MODEL_SELECTION` value and the widened request leg (§6 D2). Both are
-  **승인 대기**, and D3's `exact_equality.v1` is pending with them.
+- **It does not approve a product permission policy, and nothing has executed one.** The scope
+  that sufficed for one harmless probe is recorded as an observation and is **not** proposed as
+  a product default. The product scope **is now written** — as an explicitly unexecuted
+  proposal, `docs/OS-14-permission-scope-proposal.md` — and is **승인 대기 (PENDING)** (§3a.7,
+  §6 Permission scope). *(Superseded 2026-11-01: this bullet previously said the product scope
+  was unwritten.)*
+- The two contract changes the recommendation needs — the replaced
+  `AGENT_PROFILE_MODEL_SELECTION` value and the widened request leg — are both inside **D2's**
+  approved change scope (§6 D2's 변경 범위 names the contract value explicitly), and
+  `exact_equality.v1` is inside **D3's**; **D2 and D3 were APPROVED 2026-11-01**. No contract
+  or schema change outside D2's and D3's own stated scope is covered by that approval. *(Superseded 2026-11-01: this bullet
+  previously recorded all three as 승인 대기.)* **Approval is not implementation:** the widened
+  request leg is implemented (I-1), and the `AGENT_PROFILE_MODEL_SELECTION` replacement is
+  **I-3 and is not started** — the value in the validator, in `SKILL.md`'s 25-line block and in
+  the lock test still stands unchanged.
 - It does **not** claim that a held process survives an arbitrary wait. **90 s was measured**
   (P1) and **68.8 s** between two delivered turns on a hosted process (S-3); a Worker turn's
   worth was not, and the later measurement is the **shorter** of the two.
@@ -3051,8 +3131,17 @@ model call appears through a gateway.
   that model.
 - It does **not** claim that `orca orchestration worker-start --model` works. Only its
   `--help` was read (D7), on Orca 1.4.197.
-- **§9 is a plan, not work done.** No unit in it is implemented, no test in it exists, and
-  it is to be executed only after D2/D3/D5/D8 are approved.
+- **§9 was a plan when this document was written, and it is now PARTLY WORK DONE.**
+  *(Superseded 2026-11-01: this bullet read "No unit in it is implemented, no test in it
+  exists, and it is to be executed only after D2/D3/D5/D8 are approved.")* D2, D3, D5 and
+  D8-a..d were **approved on 2026-11-01**, so no unit waits on a decision any longer. What
+  each unit waits on is **implementation**, and the two axes are tracked separately: **I-1,
+  I-2 (minimal), I-4 and I-7 (including its engine connection) are implemented** and their
+  tests exist and run; **I-3, I-5, I-6 and I-8 are not started**; **I-9 is a written,
+  unexecuted proposal** and is the only unit still waiting on a **decision** (the product
+  permission scope); **I-10 is partial** (its two attested fields are in, its three
+  vocabulary members deliberately are not) and **I-11 is partial**. The per-unit table in
+  this document's top status block is the authority.
 - It does **not** re-run, revise or reinterpret any earlier run's experiments. E16/E17 (the
   analysis run), P1/P2 (the design run) and X-1…X-5 / S-0…S-4 (the minimal-feasibility run) are
   **cited** with their own scopes and labels; no earlier `ANALYSIS.md`, review or audit was
@@ -3062,10 +3151,32 @@ model call appears through a gateway.
   closed in `docs/OS-14-feasibility-evidence-summary.md`.
 
 
-## 9. After approval: the minimum implementation units and the verification plan
+## 9. The minimum implementation units and the verification plan — **decisions APPROVED 2026-11-01; implementation partial**
 
-**Nothing in this section is executed by this design run.** It exists so that, once D2, D3,
-D5 and D8 are decided, an implementer starts without new core decisions. Every unit names
+> **TWO AXES, and they must not be read off each other.** *(Superseded 2026-11-01: this
+> section was headed "After approval: …" and opened "Nothing in this section is executed by
+> this design run. It exists so that, once D2, D3, D5 and D8 are decided, an implementer
+> starts without new core decisions.")*
+>
+> **DECISIONS — all approved.** D2, D3, D5 and D8-a..d were approved by the user on
+> **2026-11-01** for the **local first implementation** (Jira OS-14 comment 10101). **No unit
+> below is gated on a decision any more**, with exactly one exception: **I-9**, whose
+> **product permission scope** is **승인 대기 (PENDING)** and whose written proposal
+> (`docs/OS-14-permission-scope-proposal.md`) is explicitly **not executed**.
+>
+> **IMPLEMENTATION — partial, and per unit.** **Implemented:** I-1, I-2 (minimal), I-4, I-7
+> (including its engine connection). **Not started:** I-3, I-5, I-6, I-8. **Partial:** I-10
+> (two attested fields in; three vocabulary members deliberately out), I-11. **Proposal
+> only:** I-9. The per-unit table in the top status block is the authority, and §9.3's rows
+> are still **test specifications** except where that table says a test now exists.
+>
+> So the sentence below — "nothing in this section is executed by this design run" — remains
+> **true of the DESIGN RUN that wrote it** and is **no longer true of the repository**: the
+> foundation PR that followed it implemented the four units named above.
+
+**Nothing in this section was executed by the design run that wrote it.** It exists so that
+an implementer starts without new core decisions — which, since 2026-11-01, they do. Every
+unit names
 its file, and every test names what it asserts. The order is the order they must be done in:
 a unit that could pass while an earlier one is wrong is placed after it.
 
@@ -3076,19 +3187,19 @@ wrong is placed after it. **Renumbered in this correction** — the launch lease
 capability derivation are prerequisites of the driver and of the delivery branch, so they
 move to the front, and the vocabulary members stay deliberately last.
 
-| # | Unit | File(s) | Content | Gated on |
+| # | Unit | File(s) | Content | Decision status / implementation status |
 |---|---|---|---|---|
-| **I-1** | the **launch lease** | `scripts/orca_runtime_harness.py` (a `ModelLaunchLease` dataclass beside `ModelSelectionTicket`, `:951-987`; a per-harness registry; `mint_launch_lease()`; `release(handle)`), and the new barrier leg **(a2)** after `:4281` | mint before `terminal create`, draw `launch_stamp` from the existing `_model_selection_seq` counter, bind `terminal_digest` at `CREATED`. **One lease per `terminal create`, never re-exercised by a second create** (§3a.12's mint rule), so the first create, a `CREATE_REFUSED` retry and a reuse supersession each mint a **new** token and revoke the superseded one in the **same** `CREATE_INTENDED` write. Revoke on every refusal path, on supersession, and at **round close** — **§3a.12 TL**, **not** at `settle_attempt`: the engine classifies a gate defect one node later and may re-dispatch the same role under the same key, so the lease must survive every validation-repair turn. Leg (a2)'s five checks, all of them equality or integer order over values this harness issued, mapping onto **existing** failure members (§6 D2 item 3) | **D2**, and **D8-b** for the round-scoped release |
-| **I-2** | the **hosted capability derivation** — **the rule HC** | `scripts/agent_profile.py`, beside `model_selection_capabilities` (`:1339-1363`) | **exactly the rule HC as §3a.11 defines it, and no other spelling of it anywhere**: one function, same shape as the existing one, over **two** names — the capability exists **iff** `deliver_hosted` **and** `bind_target` are **both** callable on the driver object; one name is not hosted-capable, either way round. `None` ⇒ empty set, so the real runtime stays fail-closed by default. **Both** readers call this one function over the same driver object: `bind_prepared_target` (I-7, the **preparation gate** — no HC ⇒ no hosted launch cell is minted at all) and the **deliverability** test (I-8). **HC is never a recognition input** (F-002): on a target that already carries a hosted launch cell, an absent or incomplete HC is `HOSTED_TARGET_UNDELIVERABLE` / `HOSTED_CAPABILITY_INCOMPLETE`, never a demotion to the legacy path | **D8-a** |
-| **I-3** | the **launch-command seam**, and the **contract-lock replacement it forces** | `orca_runtime_harness.py:2927` (`create_fake_terminal`), `orca_adapter.py:841-844` (`_prepare_role`); **and** `scripts/validate_skills.py:938-940` + `orca-worker-reviewer-orchestration/SKILL.md:2009` + `scripts/test_os49_contract_locks.py:99-111` | let the prepared session's `--command` be the lease's composed argv, default unchanged. **Preserve**: the model stays a separate ledger field, and the reuse gate's condition-2 identity keeps comparing `resolved_agent_command(role, phase)` — the **profile** command — while the composed argv is recorded as its own `launch_argv_digest` (`:2978-2986`). **Replace** `AGENT_PROFILE_MODEL_SELECTION`'s value in the block, the validator and the lock test in ONE commit; the block stays exactly 25 lines | **D2** (§3a.11 P-1) |
-| **I-4** | the **lease cells** on the durable record | `scripts/deterministic_workflow/pause_store.py` (`PAIR_PREPARATION_SCHEMA_VERSION`, `:851`), written at `CREATE_INTENDED` in `orca_adapter.py:830-838` | `launch_token`, `launch_stamp`, `session_uuid`, `endpoint_digest`, `launch_argv_digest`, `launch_revoked_at`, plus `terminal_digest` at `CREATED`; a **schema bump** (v3 → v4) with the same fail-closed reading the v2 → v3 bump has (older document ⇒ `PAIR_PREPARATION_RECORD_CORRUPT`, never "nothing was prepared") | **D2**, **D8** (P-2) |
-| **I-5** | the **control channel** and its **supervisor shim** | **new** `scripts/deterministic_workflow/claude_target_shim.py` (+ mirror) and the driver-side client in I-6 | mints its own **`shim_incarnation`** at startup; binds the `AF_UNIX` endpoint the harness derived, `listen(1)`, refuses a pre-existing path, **arms the ONE bootstrap deadline at listener readiness** (not at the `hello` write — F-005), writes its `hello` (pre-create fields only, plus the incarnation value), and runs the three-state machine `unbound → bound → relaying`: it **spawns** the `claude` argv as a child (**not** `exec`) only on a `bind` that passes the token **and** the incarnation compare, echoes `bound` + `child_started`, then relays NDJSON frames with per-direction `seq`. **Gives the child a pipe stdin and converts CR→LF** (§3a.12 H-1/H-2). Reports hop-2 results in a `ctl` ack carrying **both** `child_write_bytes` and `hop2_error`, so §3a.13.1's verdict is computable. Asserts the endpoint path against the platform's **own** `sun_path` size (104 bytes here, not 108). Refusal reasons `bind_unauthenticated` / `stale_incarnation` / `bootstrap_timeout` / `rebind_refused` / `unbound_channel` / `channel_already_bound`, each unlinking the endpoint, and a non-zero exit whenever it never bound. Permissions `0700` / `0600`. Full specification: **§3a.12**. Provider-specific; same C6 rule as I-6 | **D8-a** (coupling (C-2)) |
-| **I-6** | the **driver module** | **new** `scripts/deterministic_workflow/claude_model_driver.py` (+ its mirror under `orca-worker-reviewer-orchestration/tools/deterministic_workflow/`) | `class ClaudeModelDriver` with `REQUEST_METHOD` / `OBSERVATION_METHOD` / `SATISFACTION_RULE = "exact_equality.v1"` class attributes, `select_and_verify(ticket) -> ModelEvidence`, `bind_target(handle, lease)` and `deliver_hosted(handle, prompt)`; argv composition (`-p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --model <requested> --session-id <uuid> --safe-mode --setting-sources ''`); the `hello` check against the lease, the single `bind` it composes from the create receipt's handle, and the `bound`/`child_started` echo check (§3a.12); a turn-scoped stream reader keyed on the in-band markers, with **turn membership** as D3 defines it — a turn's `request_id`s are a **set**, every `assistant` event of the turn must agree on the model, events after a `result` belong to **no** turn, and **no one-`request_id`-per-turn assumption** anywhere (S-4); the four D3 conjuncts; the **fully-qualified pre-turn screen** and the **exact-equality** satisfaction test; `modelUsage` **containment**; unknown event types and unknown `system` subtypes ignored (`thinking_tokens`, `commands_changed`, `rate_limit_event` at any position are all measured); `seq`-gap detection; the **three-way delivery verdict** of §3a.13.1 in `deliver_hosted`, including the `hop2_error`-with-full-count case; the D6 mapping. **All provider syntax and stream grammar live only here** (C6) | **D2**, **D3** |
-| **I-7** | the **post-create bind, the target binding + round-scoped release** | `orca_runtime_harness.py` (`bind_prepared_target`, beside `verify_model_identity`, gated on **HC**) + **one** call from `orca_adapter.py:862-864`, right after the `CREATED` write; driver-local registry; `release(handle)` from every `_refuse_preparation` path, every bootstrap refusal, the dead-target detection, §3a.13's undeliverable refusal, **and at round close (§3a.12 TL)** | the bind nonce is minted **once per lease** and held in memory only, and the `bind` **echoes the `shim_incarnation` from this connection's `hello`**; handle → live, **bind-complete** channel, surviving `select_and_verify`'s return **and the whole gate round** (**B1-c**, **TL**). Ordering invariants **O1–O6** of §3a.12 are what this unit is tested against. A second process under a recorded handle/uuid/lease, or a second `bind` with a different identity, is `DRIVER_TARGET_REBOUND`; an unmatched `bound` echo is `DRIVER_BIND_UNCONFIRMED`; a durable lease with no live channel — after a restart **or** after a crash between `terminal create` and the bind — is `DRIVER_TARGET_UNBOUND`. All three report the existing member and **never** rebind. `release` is **idempotent**, and tolerates an endpoint the shim already unlinked. **The round-close hook is part of this unit**, because nothing else owns the round's end. It must implement §3a.12.1's predicate **exactly**: **(1a)** every role **REQUIRED by the round** is `VALIDATED` — so it needs the run's `risk` to know whether the phase Reviewer is required, and it must count a Reviewer that is **prepared but not yet dispatched** as required and `ACTIVE` — **and (1b)** ROUTE's token is neither `PREPARE_REPAIR` nor `PREPARE_PHASE_REVIEWER`. It must track the four per-role states (`ACTIVE` / `SETTLED_PENDING_VALIDATION` / `REPAIR_PENDING` / `VALIDATED`). Three hooks that must all fail their tests: one firing on `settle_attempt` releases the targets a validation repair is about to need; one firing on `VALIDATED` alone releases them while a repair is pending; and one quantifying (1a) over **dispatched** rather than **required** roles releases both handles after the accepted Worker turn, before the Reviewer runs. It owns no routing: `VALIDATION_REPAIR` is the engine's decision (`graph_spec.GRAPH_OWNED_DECISIONS`), and this hook only observes the token | **D8-a**, **D8-b** (P-3, P-8) |
-| **I-8** | the **hosted delivery branch**, with the **recognition / deliverability split** | `orca_runtime_harness.py:4690-4790` (`start_worker`), after the Gate B call at `:4683-4689` | the **two-stage** admission — recognition (**a hosted launch cell matching this handle's digest, and nothing else**) then deliverability (**HC** ∧ unrevoked lease ∧ Gate B accepted ∧ a live bind-complete target) — producing **three** verdicts: **not recognised, i.e. no hosted cell ⇒ today's code, byte-identical**; recognised ∧ deliverable ⇒ the hosted path (`wait_for_hosted_idle` in place of the `tui-idle` wait, **no** `worker-start` call, rung 4's own `dispatch` and prompt reused verbatim, the driver's write in place of `terminal send`); **recognised ∧ not deliverable ⇒ `HOSTED_TARGET_UNDELIVERABLE`, creating nothing**. `_attach_terminal(..., "low_level_tracked")` runs **only** on the `delivered` verdict, and still last — **not** on `not_delivered` and **not** on `UNKNOWN`. Full specification: **§3a.13** and **§3a.13.1** | **D8-a**, **D8-c** (P-4) |
-| **I-9** | **permission scope** for the dispatched process | the agent profile (`permission_mode`, as the standalone driver already reads) + the driver's argv | whatever the **product** permission decision approves (§6 Permission scope, §3a.7): expressible **entirely in argv**, in advance, because a non-interactive turn cannot answer a prompt; wide enough for a driver that must read, edit and test code; **never** `bypassPermissions` or `--dangerously-skip-permissions`. The experimental two-command allow-list is **not** this unit's content — it is a recorded observation | **the product permission decision** (승인 대기, separate from D8-a) |
-| **I-10** | **vocabulary members** and `ModelEvidence`'s two new attested fields | `scripts/orca_runtime_harness.py:844`, `:872`, `:1009-1019`, the type gate at `:4219-4258` + mirror | add `cli_launch_model_flag`, `cli_launch_lease_revalidation` and `stream_json_preflight_assistant`; add `launch_token: str = ""` and `launch_stamp: int = 0`. **Last**, deliberately — adding them earlier makes an unauthorised path look eligible (D1's 비보장) | **D1**, **after** D2 |
-| **I-11** | **documentation** | `docs/COMPATIBILITY.md` (OS-14 TRACK B section), this document, `docs/OS-14-feasibility-evidence-summary.md` | record the new members, the schema bump, the lease and its **mint rule**, the control-channel protocol version `os14.hosted.v1`, the satisfaction rule `exact_equality.v1`, the hosted delivery branch and its **three-way verdict**, the **round-scoped target lifetime (TL)**, the replaced contract value, and what stays fail-closed. State the **CLI-reported** scope of every model verdict explicitly, so no reader takes it for an API-served one | all of the above |
+| **I-1** | the **launch lease** | `scripts/orca_runtime_harness.py` (a `ModelLaunchLease` dataclass beside `ModelSelectionTicket`, `:951-987`; a per-harness registry; `mint_launch_lease()`; `release(handle)`), and the new barrier leg **(a2)** after `:4281` | mint before `terminal create`, draw `launch_stamp` from the existing `_model_selection_seq` counter, bind `terminal_digest` at `CREATED`. **One lease per `terminal create`, never re-exercised by a second create** (§3a.12's mint rule), so the first create, a `CREATE_REFUSED` retry and a reuse supersession each mint a **new** token and revoke the superseded one in the **same** `CREATE_INTENDED` write. Revoke on every refusal path, on supersession, and at **round close** — **§3a.12 TL**, **not** at `settle_attempt`: the engine classifies a gate defect one node later and may re-dispatch the same role under the same key, so the lease must survive every validation-repair turn. Leg (a2)'s five checks, all of them equality or integer order over values this harness issued, mapping onto **existing** failure members (§6 D2 item 3) | **APPROVED 2026-11-01** (D2; D8-b for the round-scoped release) — **IMPLEMENTED** |
+| **I-2** | the **hosted capability derivation** — **the rule HC** | `scripts/agent_profile.py`, beside `model_selection_capabilities` (`:1339-1363`) | **exactly the rule HC as §3a.11 defines it, and no other spelling of it anywhere**: one function, same shape as the existing one, over **two** names — the capability exists **iff** `deliver_hosted` **and** `bind_target` are **both** callable on the driver object; one name is not hosted-capable, either way round. `None` ⇒ empty set, so the real runtime stays fail-closed by default. **Both** readers call this one function over the same driver object: `bind_prepared_target` (I-7, the **preparation gate** — no HC ⇒ no hosted launch cell is minted at all) and the **deliverability** test (I-8). **HC is never a recognition input** (F-002): on a target that already carries a hosted launch cell, an absent or incomplete HC is `HOSTED_TARGET_UNDELIVERABLE` / `HOSTED_CAPABILITY_INCOMPLETE`, never a demotion to the legacy path | **APPROVED 2026-11-01** (D8-a) — **IMPLEMENTED, minimal** |
+| **I-3** | the **launch-command seam**, and the **contract-lock replacement it forces** | `orca_runtime_harness.py:2927` (`create_fake_terminal`), `orca_adapter.py:841-844` (`_prepare_role`); **and** `scripts/validate_skills.py:938-940` + `orca-worker-reviewer-orchestration/SKILL.md:2009` + `scripts/test_os49_contract_locks.py:99-111` | let the prepared session's `--command` be the lease's composed argv, default unchanged. **Preserve**: the model stays a separate ledger field, and the reuse gate's condition-2 identity keeps comparing `resolved_agent_command(role, phase)` — the **profile** command — while the composed argv is recorded as its own `launch_argv_digest` (`:2978-2986`). **Replace** `AGENT_PROFILE_MODEL_SELECTION`'s value in the block, the validator and the lock test in ONE commit; the block stays exactly 25 lines | **APPROVED 2026-11-01** (D2, §3a.11 P-1) — **NOT STARTED** |
+| **I-4** | the **lease cells** on the durable record | `scripts/deterministic_workflow/pause_store.py` (`PAIR_PREPARATION_SCHEMA_VERSION`, `:851`), written at `CREATE_INTENDED` in `orca_adapter.py:830-838` | `launch_token`, `launch_stamp`, `session_uuid`, `endpoint_digest`, `launch_argv_digest`, `launch_revoked_at`, plus `terminal_digest` at `CREATED`; a **schema bump** (v3 → v4) with the same fail-closed reading the v2 → v3 bump has (older document ⇒ `PAIR_PREPARATION_RECORD_CORRUPT`, never "nothing was prepared") | **APPROVED 2026-11-01** (D2, D8; P-2) — **IMPLEMENTED** |
+| **I-5** | the **control channel** and its **supervisor shim** | **new** `scripts/deterministic_workflow/claude_target_shim.py` (+ mirror) and the driver-side client in I-6 | mints its own **`shim_incarnation`** at startup; binds the `AF_UNIX` endpoint the harness derived, `listen(1)`, refuses a pre-existing path, **arms the ONE bootstrap deadline at listener readiness** (not at the `hello` write — F-005), writes its `hello` (pre-create fields only, plus the incarnation value), and runs the three-state machine `unbound → bound → relaying`: it **spawns** the `claude` argv as a child (**not** `exec`) only on a `bind` that passes the token **and** the incarnation compare, echoes `bound` + `child_started`, then relays NDJSON frames with per-direction `seq`. **Gives the child a pipe stdin and converts CR→LF** (§3a.12 H-1/H-2). Reports hop-2 results in a `ctl` ack carrying **both** `child_write_bytes` and `hop2_error`, so §3a.13.1's verdict is computable. Asserts the endpoint path against the platform's **own** `sun_path` size (104 bytes here, not 108). Refusal reasons `bind_unauthenticated` / `stale_incarnation` / `bootstrap_timeout` / `rebind_refused` / `unbound_channel` / `channel_already_bound`, each unlinking the endpoint, and a non-zero exit whenever it never bound. Permissions `0700` / `0600`. Full specification: **§3a.12**. Provider-specific; same C6 rule as I-6 | **APPROVED 2026-11-01** (D8-a, coupling (C-2)) — **NOT STARTED** |
+| **I-6** | the **driver module** | **new** `scripts/deterministic_workflow/claude_model_driver.py` (+ its mirror under `orca-worker-reviewer-orchestration/tools/deterministic_workflow/`) | `class ClaudeModelDriver` with `REQUEST_METHOD` / `OBSERVATION_METHOD` / `SATISFACTION_RULE = "exact_equality.v1"` class attributes, `select_and_verify(ticket) -> ModelEvidence`, `bind_target(handle, lease)` and `deliver_hosted(handle, prompt)`; argv composition (`-p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --model <requested> --session-id <uuid> --safe-mode --setting-sources ''`); the `hello` check against the lease, the single `bind` it composes from the create receipt's handle, and the `bound`/`child_started` echo check (§3a.12); a turn-scoped stream reader keyed on the in-band markers, with **turn membership** as D3 defines it — a turn's `request_id`s are a **set**, every `assistant` event of the turn must agree on the model, events after a `result` belong to **no** turn, and **no one-`request_id`-per-turn assumption** anywhere (S-4); the four D3 conjuncts; the **fully-qualified pre-turn screen** and the **exact-equality** satisfaction test; `modelUsage` **containment**; unknown event types and unknown `system` subtypes ignored (`thinking_tokens`, `commands_changed`, `rate_limit_event` at any position are all measured); `seq`-gap detection; the **three-way delivery verdict** of §3a.13.1 in `deliver_hosted`, including the `hop2_error`-with-full-count case; the D6 mapping. **All provider syntax and stream grammar live only here** (C6) | **APPROVED 2026-11-01** (D2, D3) — **NOT STARTED** |
+| **I-7** | the **post-create bind, the target binding + round-scoped release** | `orca_runtime_harness.py` (`bind_prepared_target`, beside `verify_model_identity`, gated on **HC**) + **one** call from `orca_adapter.py:862-864`, right after the `CREATED` write; driver-local registry; `release(handle)` from every `_refuse_preparation` path, every bootstrap refusal, the dead-target detection, §3a.13's undeliverable refusal, **and at round close (§3a.12 TL)** | the bind nonce is minted **once per lease** and held in memory only, and the `bind` **echoes the `shim_incarnation` from this connection's `hello`**; handle → live, **bind-complete** channel, surviving `select_and_verify`'s return **and the whole gate round** (**B1-c**, **TL**). Ordering invariants **O1–O6** of §3a.12 are what this unit is tested against. A second process under a recorded handle/uuid/lease, or a second `bind` with a different identity, is `DRIVER_TARGET_REBOUND`; an unmatched `bound` echo is `DRIVER_BIND_UNCONFIRMED`; a durable lease with no live channel — after a restart **or** after a crash between `terminal create` and the bind — is `DRIVER_TARGET_UNBOUND`. All three report the existing member and **never** rebind. `release` is **idempotent**, and tolerates an endpoint the shim already unlinked. **The round-close hook is part of this unit**, because nothing else owns the round's end. It must implement §3a.12.1's predicate **exactly**: **(1a)** every role **REQUIRED by the round** is `VALIDATED` — so it needs the run's `risk` to know whether the phase Reviewer is required, and it must count a Reviewer that is **prepared but not yet dispatched** as required and `ACTIVE` — **and (1b)** ROUTE's token is neither `PREPARE_REPAIR` nor `PREPARE_PHASE_REVIEWER`. It must track the four per-role states (`ACTIVE` / `SETTLED_PENDING_VALIDATION` / `REPAIR_PENDING` / `VALIDATED`). Three hooks that must all fail their tests: one firing on `settle_attempt` releases the targets a validation repair is about to need; one firing on `VALIDATED` alone releases them while a repair is pending; and one quantifying (1a) over **dispatched** rather than **required** roles releases both handles after the accepted Worker turn, before the Reviewer runs. It owns no routing: `VALIDATION_REPAIR` is the engine's decision (`graph_spec.GRAPH_OWNED_DECISIONS`), and this hook only observes the token | **APPROVED 2026-11-01** (D8-a, D8-b; P-3, P-8) — **IMPLEMENTED**, including the engine connection |
+| **I-8** | the **hosted delivery branch**, with the **recognition / deliverability split** | `orca_runtime_harness.py:4690-4790` (`start_worker`), after the Gate B call at `:4683-4689` | the **two-stage** admission — recognition (**a hosted launch cell matching this handle's digest, and nothing else**) then deliverability (**HC** ∧ unrevoked lease ∧ Gate B accepted ∧ a live bind-complete target) — producing **three** verdicts: **not recognised, i.e. no hosted cell ⇒ today's code, byte-identical**; recognised ∧ deliverable ⇒ the hosted path (`wait_for_hosted_idle` in place of the `tui-idle` wait, **no** `worker-start` call, rung 4's own `dispatch` and prompt reused verbatim, the driver's write in place of `terminal send`); **recognised ∧ not deliverable ⇒ `HOSTED_TARGET_UNDELIVERABLE`, creating nothing**. `_attach_terminal(..., "low_level_tracked")` runs **only** on the `delivered` verdict, and still last — **not** on `not_delivered` and **not** on `UNKNOWN`. Full specification: **§3a.13** and **§3a.13.1** | **APPROVED 2026-11-01** (D8-a, D8-c; P-4) — **NOT STARTED** |
+| **I-9** | **permission scope** for the dispatched process | the agent profile (`permission_mode`, as the standalone driver already reads) + the driver's argv | whatever the **product** permission decision approves (§6 Permission scope, §3a.7): expressible **entirely in argv**, in advance, because a non-interactive turn cannot answer a prompt; wide enough for a driver that must read, edit and test code; **never** `bypassPermissions` or `--dangerously-skip-permissions`. The experimental two-command allow-list is **not** this unit's content — it is a recorded observation | **승인 대기 (PENDING)** — the product permission decision, separate from D8-a and the **only** unit in this table still awaiting a decision. Written up as an unexecuted proposal (`docs/OS-14-permission-scope-proposal.md`) — **NOT EXECUTED** |
+| **I-10** | **vocabulary members** and `ModelEvidence`'s two new attested fields | `scripts/orca_runtime_harness.py:844`, `:872`, `:1009-1019`, the type gate at `:4219-4258` + mirror | add `cli_launch_model_flag`, `cli_launch_lease_revalidation` and `stream_json_preflight_assistant`; add `launch_token: str = ""` and `launch_stamp: int = 0`. **Last**, deliberately — adding them earlier makes an unauthorised path look eligible (D1's 비보장) | **No user approval attaches to this unit.** Its gate is **D1**, which the merged design records as *"downstream of D2 — implementation decision"*, and D1 was **not** part of the 2026-11-01 approval (that granted D2, D3, D5, D8-a..d only). D2 — which D1 is downstream of — **is** approved. — **PARTIAL**: the two attested `ModelEvidence` fields are in; the three vocabulary members are deliberately **deferred**, an implementation-ordering choice and **not** a pending user approval |
+| **I-11** | **documentation** | `docs/COMPATIBILITY.md` (OS-14 TRACK B section), this document, `docs/OS-14-feasibility-evidence-summary.md` | record the new members, the schema bump, the lease and its **mint rule**, the control-channel protocol version `os14.hosted.v1`, the satisfaction rule `exact_equality.v1`, the hosted delivery branch and its **three-way verdict**, the **round-scoped target lifetime (TL)**, the replaced contract value, and what stays fail-closed. State the **CLI-reported** scope of every model verdict explicitly, so no reader takes it for an API-served one | Inherits each unit's own status: **APPROVED 2026-11-01** for the units gated on **D2 / D3 / D5 / D8-a..d**; **no user approval** for the **D1**-gated part (I-10, an implementation decision); **승인 대기 (PENDING)** for I-9's product permission scope — **PARTIAL** |
 
 ### 9.2 Regression tests — the existing protections that must still hold
 
@@ -3295,5 +3406,9 @@ pre-filled handle/digest.
   separate work with their own observations, and none is in this plan.
 - **No company-environment work** (§7), **no** `/model` experiment, **no** Orca
   `worker-start --model` execution (D7).
-- **No `-p` → interactive migration.** If D8 later chooses the interactive target, this plan
-  is superseded, not extended.
+- **No `-p` → interactive migration.** **D8-a's approved target (2026-11-01) is the
+  NON-INTERACTIVE hosted `claude -p` process**, so this plan is not written against an
+  interactive one. *(Superseded 2026-11-01: this bullet read "If D8 later chooses the
+  interactive target, this plan is superseded, not extended.")* Should an interactive target
+  ever be wanted, that is a **new decision** and would supersede this plan rather than
+  extend it — it is not a pending branch of D8.

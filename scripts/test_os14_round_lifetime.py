@@ -22,8 +22,11 @@ NO MODEL TURN IS SPENT, and no stand-in success here is a model-identity verific
 """
 from __future__ import annotations
 
+import os
 import unittest
+from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from scripts.deterministic_workflow import (contracts, executor, graph_spec, launcher,
                                             routing)
@@ -69,6 +72,39 @@ def lifetime_code() -> str:
                 and isinstance(body[0].value.value, str)):
             node.body = body[1:] or [ast.Pass()]
     return ast.unparse(tree)
+
+
+# ======================================================================================
+# the NO-REAL-CLI guard — module-wide, so no test here can need an `orca` binary
+# ======================================================================================
+#: The path `_resolve_orca` is told to use.  It is consulted BEFORE `shutil.which("orca")`
+#: (`orca_runtime_harness._resolve_orca`), so with it set the harness constructs on a host
+#: that has no Orca CLI at all -- which every CI runner is.  The value is the one the rest
+#: of this repository's harness tests already use (`test_os14_pair_preparation`,
+#: `test_os49_delivery_barrier`), so a reader recognises it.
+#:
+#: **Why module-wide and not only at the one construction site.** `OrcaRuntimeHarness.__init__`
+#: resolves the executable unconditionally, so ANY direct construction fails on a host
+#: without the binary.  CI proved that: one test built a successor harness without this and
+#: five of six lanes errored, while both local lanes were green because a real `orca` was on
+#: PATH.  A module-level guard makes the whole module independent of the host rather than
+#: making one test independent of it, so a test added later cannot reintroduce the
+#: dependency.  It weakens nothing: every test in this module replaces the harness's single
+#: process boundary (`_exec_orca`) with a recorder, so the resolved path is never executed --
+#: it only has to exist as a STRING.
+NO_REAL_CLI = "/opt/orca-dev"
+_CLI_GUARD: Any = None
+
+
+def setUpModule() -> None:
+    global _CLI_GUARD
+    _CLI_GUARD = patch.dict(os.environ, {"ORCA_CLI_COMMAND": NO_REAL_CLI})
+    _CLI_GUARD.start()
+
+
+def tearDownModule() -> None:
+    if _CLI_GUARD is not None:
+        _CLI_GUARD.stop()
 
 
 # ======================================================================================
