@@ -65,9 +65,66 @@ def validate_node(state: dict[str, Any]) -> dict[str, Any]:
     return {**state, "logical_trace": _trace(state, "VALIDATE")}
 
 
-def route_node(state: dict[str, Any]) -> dict[str, Any]:
+# ---- OS-14 I-7: the round-lifecycle OBSERVER seam ------------------------------------
+# The engine reports four facts -- a role settled, a settlement validated clean, the token
+# ROUTE emitted, a PAUSE/DISPOSE ran -- to the adapter port that owns target lifetime, and
+# ignores whatever it answers.  Four properties make this an observation rather than a
+# second decision-maker, and each is asserted by a test:
+#
+#   1. the engine computes its token FIRST and reports it verbatim; no node reads anything
+#      back from the port, so no routing, repair or budget decision can depend on it.
+#      `graph_spec.GRAPH_OWNED_DECISIONS` keeps owning all of them;
+#   2. an adapter with no port -- the fake adapter, a legacy run, a `None` driver -- gets a
+#      no-op, so every path that must stay byte-identical does;
+#   3. the wrapper is TOTAL for ordinary exceptions: a channel teardown that fails must not
+#      change where the workflow goes next. `BaseException` still propagates, so an
+#      interrupt or an interpreter exit is not swallowed;
+#   4. it is read ONCE, at graph build time, so a node cannot acquire a different observer
+#      half way through a run.
+def round_lifecycle_observer(adapter: Any) -> Any:
+    """The adapter's round-lifecycle port, or `None` when it has none.
+
+    `None` rather than a no-op callable so every call site reads `if lifecycle is not
+    None`, which makes the inert path visible at the node instead of hidden one frame
+    down.
+    """
+    port = getattr(adapter, "observe_round_lifecycle", None)
+    if not callable(port):
+        return None
+
+    def observe(event: str, **facts: Any) -> tuple:
+        try:
+            return tuple(port(event, **facts) or ())
+        except Exception:  # noqa: BLE001 - a teardown never changes a routing decision
+            return ()
+
+    return observe
+
+
+def route_node(state: dict[str, Any], *, lifecycle: Any = None) -> dict[str, Any]:
     token = (state.get("route_token") or "BLOCK") if state.get("terminal_reason") else route(state)
+    # OS-14 I-7.  Reported AFTER the token is decided and BEFORE the state update is
+    # built, and the result is deliberately discarded: the token this node returns is the
+    # one `route()` produced, whatever the observer did with it.  `repair_binding` is the
+    # engine's own statement of which role a `PREPARE_REPAIR` re-dispatches, and `risk` is
+    # the field `routing.phase_gate` itself reads, so the observer quantifies over the
+    # same required-role set the gate does.
+    if lifecycle is not None:
+        lifecycle("route", token=token, risk=str(state.get("risk") or ""),
+                  repair_role=str((state.get("repair_binding") or {}).get("role") or ""))
     return {**state, "route_token": token, "logical_trace": _trace(state, "ROUTE", route=token)}
+
+
+def lifecycle_bound(node: Any, lifecycle: Any) -> Any:
+    """Bind an observer to a node that takes one, keeping the `node(state)` shape.
+
+    Used by `graph.build_graph` for the pure nodes; the factory nodes take the observer as
+    a keyword argument instead.
+    """
+    def bound(state: dict[str, Any]) -> dict[str, Any]:
+        return node(state, lifecycle=lifecycle)
+
+    return bound
 
 
 def prepare_intent_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -312,7 +369,7 @@ def _observe_then_take_over(adapter: Any, ledger: Any, intent: dict[str, Any],
 def execute_intent_node(adapter: Any, runtime_state: Any = None, *,
                         observe_timeout_seconds: float = DEFAULT_OBSERVE_TIMEOUT_SECONDS,
                         heartbeat_interval_seconds: float | None = None,
-                        keeper_factory: Any = None):
+                        keeper_factory: Any = None, lifecycle: Any = None):
     """Build the EXECUTE_INTENT node, refusing to run without a durable ledger.
 
     The port is resolved once, at construction, so a path that cannot be crash-safe fails
@@ -331,6 +388,7 @@ def execute_intent_node(adapter: Any, runtime_state: Any = None, *,
     ledger = resolve_runtime_state(adapter, runtime_state)
     factory = keeper_factory or lease_keeper_factory(
         interval_seconds=heartbeat_interval_seconds)
+    observer = lifecycle if lifecycle is not None else round_lifecycle_observer(adapter)
 
     def node(state: dict[str, Any]) -> dict[str, Any]:
         intent = state["pending_intent"]
@@ -340,6 +398,14 @@ def execute_intent_node(adapter: Any, runtime_state: Any = None, *,
         except RuntimeStateLeaseHeld:
             event = _observe_then_take_over(adapter, ledger, intent, observe_timeout_seconds,
                                             factory)
+        # OS-14 I-7.  `settle_attempt` has run for this role's Dispatch and
+        # VALIDATE_SETTLEMENT has not classified the result yet, which is exactly
+        # `SETTLED_PENDING_VALIDATION`.  Reported for every path that produces an event --
+        # a fresh settlement, a recovered one and an adopted `ALREADY_SETTLED` -- because
+        # all three mean the same thing about the role.  A settlement whose form nobody has
+        # checked yet is not a finished role, so this permits no release.
+        if observer is not None:
+            observer("settled", intent=intent)
         return {**state, "pending_event": event, "intent_status": "SETTLED",
                 "logical_trace": _trace(state, "EXECUTE_INTENT", event_id=event["event_id"])}
     return node
@@ -440,7 +506,7 @@ def _settlement_row(port: Any, journal: Any, intent_id: str, *, now: str) -> dic
 
 def pause_node(settlement_port: Any, approval_port: Any, *, clock: Any = None,
                skill_path: Any = None, journal: Any = None,
-               sources_provider: Any = None):
+               sources_provider: Any = None, lifecycle: Any = None):
     """Build the PAUSE node: the ONE place the engine performs lifecycle settlement.
 
     ``terminal_node`` still performs no external call.  Both ports are capability-gated
@@ -448,9 +514,19 @@ def pause_node(settlement_port: Any, approval_port: Any, *, clock: Any = None,
     refused the route when either capability is missing.
     """
     ticker = clock or _WallClock()
+    observer = (lifecycle if lifecycle is not None
+                else round_lifecycle_observer(settlement_port))
 
     def node(state: dict[str, Any]) -> dict[str, Any]:
         now = ticker.now()
+        # OS-14 I-7, TL clause 2 by name: the PAUSING path.  A pause DISPOSES rather than
+        # holds, deliberately -- a resume is a different process, the binding is
+        # in-process, and the restart rule is a named refusal, so holding across a pause
+        # would preserve nothing and would leave two live processes nobody will reuse.
+        # Idempotent with the ROUTE observation of the same `PAUSE` token: the round key
+        # closes once.
+        if observer is not None:
+            observer("dispose", reason="PAUSE")
         try:
             intent_ids = tuple(settlement_port.open_dispatches())
         except pause_policy.PauseRefused as exc:
@@ -513,7 +589,8 @@ def pause_node(settlement_port: Any, approval_port: Any, *, clock: Any = None,
     return node
 
 
-def dispose_node(settlement_port: Any = None, *, clock: Any = None, journal: Any = None):
+def dispose_node(settlement_port: Any = None, *, clock: Any = None, journal: Any = None,
+                 lifecycle: Any = None):
     """Build the DISPOSE node: explicit cancel/abandon of an already-paused run.
 
     Bindings are deliberately **frozen**, not re-validated: a moved head is not a reason to
@@ -521,9 +598,17 @@ def dispose_node(settlement_port: Any = None, *, clock: Any = None, journal: Any
     asserted as a pair.
     """
     ticker = clock or _WallClock()
+    observer = (lifecycle if lifecycle is not None
+                else round_lifecycle_observer(settlement_port))
 
     def node(state: dict[str, Any]) -> dict[str, Any]:
         now = ticker.now()
+        # OS-14 I-7, TL clause 2 by name: the DISPOSING path (`CANCEL` / `ABANDON`),
+        # before TERMINAL.  Idempotent with the ROUTE observation of the same token.
+        if observer is not None:
+            observer("dispose", reason=str(
+                ((state.get("pause_binding") or {}).get("disposition") or {}).get("kind")
+                or "DISPOSE"))
         new = deepcopy(state)
         binding = deepcopy(new["pause_binding"] or {})
         disposition = binding.get("disposition") or {}
@@ -605,7 +690,21 @@ def _residual_row(port: Any, journal: Any, intent_id: str, *, now: str,
     return pause_policy.validate_settlement_row(row)
 
 
-def validate_settlement_node(policy: Any = None, classifier: Any = None):
+def _observe_validated(lifecycle: Any, intent: Any) -> None:
+    """Report one clean settlement validation, or do nothing.
+
+    A DEFECTIVE settlement is deliberately not reported at all: the role stays
+    `SETTLED_PENDING_VALIDATION`, and whether it becomes `REPAIR_PENDING` is ROUTE's
+    decision one node later (`PREPARE_REPAIR` iff the code is `DECISION_GATE_FORM_DEFECT`
+    and the budget allows) -- which is the engine's own ordering and is not re-derived
+    here.
+    """
+    if lifecycle is not None and intent:
+        lifecycle("validated", intent=intent)
+
+
+def validate_settlement_node(policy: Any = None, classifier: Any = None, *,
+                             lifecycle: Any = None):
     """Build the VALIDATE_SETTLEMENT node, closing over the decision policy.
 
     A FACTORY, mirroring ``execute_intent_node(adapter, runtime_state)``: the policy is
@@ -616,6 +715,9 @@ def validate_settlement_node(policy: Any = None, classifier: Any = None):
 
     Called with no arguments it behaves exactly as before OS-42: no policy, no gate
     classification, every existing path unchanged.
+
+    ``lifecycle`` is OS-14 I-7's observer and defaults to ``None`` -- the node's own
+    behaviour is identical with and without it; it reports a fact and discards the answer.
     """
 
     def node(state: dict[str, Any]) -> dict[str, Any]:
@@ -633,6 +735,12 @@ def validate_settlement_node(policy: Any = None, classifier: Any = None):
             return {**state, "terminal_reason": {"code": exc.code, "message": str(exc)},
                     "logical_trace": _trace(state, "VALIDATE_SETTLEMENT", reason_code=exc.code)}
         if policy is None or classifier is None:
+            # No gate contract is wired, so no defect can be classified for this
+            # settlement.  OS-14 I-7 reports that as VALIDATED rather than leaving the
+            # role at SETTLED_PENDING_VALIDATION for ever: "the result's FORM was
+            # accepted" is exactly what "nothing classified a defect" means, and a round
+            # that could never reach VALIDATED could never close under clause 1.
+            _observe_validated(lifecycle, intent)
             return {**state, "logical_trace": _trace(state, "VALIDATE_SETTLEMENT")}
         # OS-42 F-001. The classifier is given BOTH halves of the record's identity: the
         # role this dispatch was sent out under, and the run/phase/gate-iteration the
@@ -646,6 +754,11 @@ def validate_settlement_node(policy: Any = None, classifier: Any = None):
                                                                intent["phase"]),
                      "iteration": intent["gate_iteration"]})
         if not defects:
+            # OS-14 I-7: VALIDATE_SETTLEMENT produced NO pending gate defect for this
+            # role's settlement -- the result's FORM was accepted.  Release is permitted
+            # only together with the round-close condition, never on this alone, which is
+            # why this reports a STATE and not a disposal.
+            _observe_validated(lifecycle, intent)
             return {**state, "logical_trace": _trace(state, "VALIDATE_SETTLEMENT")}
         kinds = {defect.kind for defect in defects}
         # An EQUALITY, not a membership test: a mixed list containing even one SEMANTIC or

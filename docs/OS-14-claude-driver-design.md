@@ -1,13 +1,80 @@
-# OS-14 — the real Claude Code model-selection driver: DESIGN ONLY
+# OS-14 — the real Claude Code model-selection driver: the DESIGN, and what is now implemented
 
-**This document is a design. Nothing in it is implemented.** No driver here exists in the
-tree, no vocabulary member is added by it, no `/model` experiment was run for it, and no
-company (PortKey/GLM) environment was touched. It is the written form of the four design
-items OS-14 owes, so that the *common* Worker/Reviewer pair-preparation work — which is
-implemented separately, against the existing reference (fake) driver — could proceed without
-pre-deciding any of them. **Status at merge base `7ec657f`: that common work is MERGED**
-(PR #38, TRACK A), and it did proceed without deciding any of D1–D8. What is still
-unimplemented is the real driver (TRACK B), which is what §3a, §6 and §9 are about.
+> ## STATUS BLOCK — read this first (updated 2026-11-01)
+>
+> **This document is the DESIGN.** It was written as design-only, and the great majority of
+> it still is. What changed on **2026-11-01** is that the user **approved** the decision
+> items below for a **local first implementation**, and a **first foundation PR** then
+> implemented three of §9.1's eleven units. The per-unit table immediately after this block
+> is the authority on which; every other section of this document continues to describe the
+> design, not the tree.
+>
+> ### The 2026-11-01 user approval, as recorded
+>
+> Recorded here and in **Jira OS-14 comment 10101** (the same scope; this block is usable
+> without access to the comment). The approval is a **policy decision for the local first
+> implementation** — it is **not** an instruction to implement everything below at once.
+>
+> | Item | Approved content | Explicitly NOT granted by it |
+> |---|---|---|
+> | **D2** | the harness pre-records the first launch request as a **lease**, and every later call **re-validates** that lease (`cli_launch_lease_revalidation` semantics). A call that performed no new launch and no new model selection is never presented as a new selection request | — |
+> | **D3** | the first local implementation uses **`exact_equality.v1`** over the **fully qualified** model ID, with session/turn/response correlation. **Alias and gateway-alias are not supported.** | it is a **CLI-reported** model verification, **not** an independent proof of the model a server actually ran, and a preflight does **not** guarantee the model of the next real-task turn |
+> | **D5** | the pre-pass **and** the per-dispatch Gate B re-verification are both kept. The design cost of one normal two-role round is **6 preflight + 2 real-task** turns, plus **+3 preflight / +1 real-task** per validation repair | it is **not** a billing or latency guarantee and **not** an unlimited model-call budget |
+> | **D8-a…d** | C-2 supervisor/relay and Orca-hosted non-interactive execution as the target shape; target/channel/lease held for the **gate round**; the final **TL** rule including normal close (clause 1), refusal/disposal (clause 2) and the Coordinator process-exit row; a hosted target's validity failure **never** falls back to the legacy delivery path; `delivered` / `not_delivered` / **UNKNOWN** are distinguished, and UNKNOWN triggers no automatic resend, no alternate-target delivery and no success settlement; **no** Coordinator-restart rebinding or auto-recovery in the first scope; `release` is **channel and lease** cleanup and **not** an automatic CLI-child or terminal termination — a residual session follows the existing ownership and operational procedure | — |
+>
+> **NOT approved, and still 승인 대기: the product PERMISSION SCOPE.** The experimental
+> allow-list is **not** promoted to a product default and no execution permission is widened.
+> The written proposal is `docs/OS-14-permission-scope-proposal.md` — a **proposal only**,
+> nothing in it executed. Its absence is deliberately **not** a blocker for the foundation
+> code, and the two were separated for that reason.
+>
+> ### What the first foundation PR implemented — per §9.1 unit
+>
+> Branch `feat/os-14-launch-lease-foundation`, from `main` at `3bf7901` (the PR #39 merge).
+> **No real driver is registered or enabled, no `claude` process is launched by any code path
+> in it, and its experimental model-turn budget was ZERO.** Every test that exercises the new
+> code drives it with a **stand-in** at the production boundary; a stand-in's success is
+> wiring evidence and is **never** a model-identity verification.
+>
+> | Unit | Status | What this PR covers, and what it does not |
+> |---|---|---|
+> | **I-1** the launch lease | **implemented** | `ModelLaunchLease` beside `ModelSelectionTicket`; a per-harness registry; `mint_launch_lease()` **before** the external create effect; `launch_stamp` drawn from the existing `_model_selection_seq`; `terminal_digest` bound at `CREATED`; idempotent `release(handle)`; the mint rule (first create / confirmed `CREATE_REFUSED` retry / reuse supersession each mint a NEW token and revoke the superseded one in the same `CREATE_INTENDED` write, and no path re-exercises a token across a create); the derived endpoint path asserted against the **platform's own** `sun_path`; and the new barrier leg **(a2)**, five checks mapped onto **existing** failure members. **Not covered:** nothing of I-1 — but note the two attested `ModelEvidence` fields it needs were taken from I-10 (below) |
+> | **I-2** the hosted-capability derivation (**HC**) | **implemented, minimal** | `agent_profile.hosted_delivery_capabilities` — one function, two names, `deliver_hosted` **and** `bind_target` both callable; `None` ⇒ empty set. Read by `bind_prepared_target` (the preparation gate) through one harness accessor. **Not covered:** I-8's deliverability reader, which does not exist yet; and HC is deliberately never a recognition input |
+> | **I-3** the launch-command seam + the contract-lock replacement | **not started** | `AGENT_PROFILE_MODEL_SELECTION` is **unchanged**, the 25-line anchor block is untouched, and the prepared session's `--command` is still the profile command. Consequence, stated: `launch_argv_digest` in this release digests the launch **request** (command, model, session uuid, endpoint digest), not a literal argv, because there is no composed argv to digest yet |
+> | **I-4** the lease cells on the durable record | **implemented** | schema bump **v3 → v4**; `launch_token`, `launch_stamp`, `session_uuid`, `endpoint_digest`, `launch_argv_digest`, `launch_revoked_at` added, with `terminal_digest` still bound at `CREATED`; whole-or-nothing validation; the attempt-cleared set clears them so a replacement is never born stale; writer, reader, validator, lock test, mirror and `docs/COMPATIBILITY.md` moved together; the same fail-closed reading the v2 → v3 bump has, **inherited** from `read_json_document` rather than re-implemented. **No** in-place conversion, **no** silent emptying, **no** drain of past in-flight runs |
+> | **I-5** the control channel and its supervisor shim | **not started** | no `AF_UNIX` socket is bound by this release and no shim exists. The harness **derives** the endpoint path and records its digest; nothing listens on it |
+> | **I-6** the driver module | **not started** | no `ClaudeModelDriver`, no argv composition, no stream parser, no provider syntax anywhere in the tree |
+> | **I-7** the post-create bind + the round-scoped release, **including the engine connection** | **implemented** | `bind_prepared_target` (gated on HC) and its **one** call from `_prepare_role` immediately after the `CREATED` write; the driver-local binding registry; the bind nonce minted once per lease and never durable; `DRIVER_TARGET_UNBOUND` / `_REBOUND` / `_BIND_UNCONFIRMED` as named refusals that never rebind; `release(handle)` from every `_refuse_preparation` path, from `_revoke_model_authority`, on a reuse supersession and at round close; `RoundTargetLifetime` — §3a.12.1's close predicate **exactly**, with the four per-role states and the risk-derived required-role set; **and the ENGINE CONNECTION**: `OrcaAdapter.observe_round_lifecycle` is the one port, and the deterministic engine reports through it from **five** call sites — `execute_intent_node` (the role settled), `validate_settlement_node` (its clean validation), `route_node` (the token it just computed, plus the run's `risk` and `repair_binding`'s role), and the **PAUSE** and **DISPOSE** nodes (clause 2 by name) — all bound once in `graph.build_graph`. The hook OBSERVES: every node computes its own answer first and discards the observer's, and an adapter with no port (legacy / `None` driver / the fake adapter) gets a no-op. Driven end to end through `launcher.execute_state` by `test_os14_round_lifetime.EngineConnectionTests`, which also rejects the three wrong hooks on the same real round |
+> | **I-8** the hosted delivery branch | **not started** | `start_worker` is unchanged. There is no recognition stage, no deliverability test and no three-way verdict; a hosted target cannot be delivered to at all, which is the fail-closed state rather than a gap |
+> | **I-9** permission scope | **PROPOSAL only** | `docs/OS-14-permission-scope-proposal.md`. Nothing executed, nothing configured, no permission widened |
+> | **I-10** vocabulary members + `ModelEvidence`'s two attested fields | **partial, and deliberately so** | **the two FIELDS are implemented** (`launch_token: str = ""`, `launch_stamp: int = 0`, additive, validated by the hoisted type gate), because leg (a2) has nothing to validate without a citation and a leg that cannot be exercised is not a protection. **The three MEMBERS are not:** `cli_launch_model_flag`, `cli_launch_lease_revalidation` and `stream_json_preflight_assistant` are all still absent from the closed sets, so a driver attesting one is refused `model_selection_unsupported` — which is asserted. D2's revalidation semantics are enforced **structurally** (one lease per create; both calls of an attempt cite the same token) while the self-describing member name waits for I-10 |
+> | **I-11** documentation | **partial** | this status block and the per-unit table; `docs/COMPATIBILITY.md`'s new TRACK B section (the v4 bump and its fail-closed reading, the lease cells, the barrier leg, TL's release timing **and its engine connection**, the derived endpoint, and what stays unsupported by default); and the permission proposal. **Not covered:** the control-channel protocol version, the satisfaction rule, the hosted delivery verdict and the replaced contract value — all of which belong to units that are not started |
+>
+> ### What a real-model run would still have to verify, and this PR did not
+>
+> No model identity has been verified against any provider by this code. The hold's
+> **wall-clock** cost remains unmeasured (D5). The company (PortKey/GLM) environment is
+> untouched (§7). And every row of §9.3's Group 0, Group 2, Group 4 and Group 5, plus the
+> shim-process rows of Group 3, remain **test specifications** rather than results.
+>
+> One engine route is covered at its own node rather than through a whole graph run: an
+> **admissible PAUSE**, and the `CANCEL`/`ABANDON` dispositions that follow one, need the
+> approval authority and a paused checkpoint, which is `test_deterministic_workflow_pause_e2e`'s
+> subject. TL's disposal of those rounds is asserted through the real `route_node` (with
+> `routing.route` producing the token) and through the real `pause_node` / `dispose_node`
+> callables with the observer `build_graph` binds — and that binding is itself asserted.
+>
+> **This is not the completion of OS-14 and not the completion of the real Claude
+> integration.** It is the foundation the remaining units are built on.
+
+**The rest of this document is the DESIGN.** No driver described below exists in the tree
+beyond the three units named above, no `/model` experiment was run for it, and no company
+(PortKey/GLM) environment was touched. It is the written form of the four design items OS-14
+owes, so that the *common* Worker/Reviewer pair-preparation work — which was implemented
+separately, against the existing reference (fake) driver — could proceed without pre-deciding
+any of them. **That common work is MERGED** (PR #38, TRACK A), and it did proceed without
+deciding any of D1–D8. What is still unimplemented is most of the real driver (TRACK B),
+which is what §3a, §6 and §9 are about.
 
 Two further statements, made here because they are the ones most easily lost:
 
@@ -2823,6 +2890,17 @@ verified evidence.
 
 
 ### Permission scope for the dispatched process — **two separate pending items**
+
+> **Status (2026-11-01): still 승인 대기, and now written up.** The 2026-11-01 approval
+> covered D2/D3/D5/D8 and deliberately did **not** cover this. The written proposal —
+> per-role read/edit/test/`worker_done` needs, the workspace and settings it would apply,
+> the concrete tool and command permissions, the excluded scope, the limits it **cannot**
+> enforce, non-interactive prompt handling, and a small post-approval verification with a
+> model-turn budget — is **`docs/OS-14-permission-scope-proposal.md`**. Every option name in
+> it was read from the installed CLI's own read-only help (`claude -p --help`, 2.1.260,
+> 2026-11-01); none is invented. **Nothing in it has been executed, configured or enabled**,
+> and I-9 stays unimplemented until it is answered. The paragraphs below are the original
+> §6 framing and are unchanged.
 
 Carried in §6 because it is a user decision with the same seven fields as D1–D8, and because
 D8's security half is the one thing an approval of the execution shape does **not** settle.

@@ -195,6 +195,12 @@ REASON_WORKER_REVIEWER_MUST_DIFFER = "WORKER_REVIEWER_MUST_DIFFER"
 # deterministic-workflow package, and scripts/test_os49_vocabulary_locks.py asserts
 # the two spellings are identical so the duplication cannot drift.
 MODEL_SELECTION_VERIFIED_CAPABILITY = "model_selection_verified"
+# OS-14 I-2. The HOSTED-DELIVERY capability token, beside the model-selection one and
+# deliberately NOT a member of it: a driver may be able to request and verify a model
+# selection (`select_and_verify`) without being able to HOST the session it verified.
+# The two are separate capabilities with separate derivations, so one can never be read
+# off the other -- which is the DR-02/F-002 defect in its constant form.
+HOSTED_DELIVERY_CAPABILITY = "hosted_delivery"
 
 # ---- audit evidence event names ------------------------------------------------------
 # Defined here, not in run_logging.py. The log writer's `event`, `role`, `result`
@@ -1360,6 +1366,42 @@ def model_selection_capabilities(driver: Any) -> frozenset[str]:
     """
     if callable(getattr(driver, "select_and_verify", None)):
         return frozenset({MODEL_SELECTION_VERIFIED_CAPABILITY})
+    return frozenset()
+
+
+def hosted_delivery_capabilities(driver: Any) -> frozenset[str]:
+    """OS-14 I-2 -- **the rule HC**, and the ONE derivation of it anywhere in this tree.
+
+    Same shape as :func:`model_selection_capabilities` above, over TWO names:
+
+        the hosted-delivery capability exists IFF `deliver_hosted` AND `bind_target`
+        are BOTH callable on the driver object.
+
+    One name is not hosted-capable, either way round: a driver that can deliver but
+    cannot bind has no way to learn which Orca terminal its child is attached to, and a
+    driver that can bind but cannot deliver has nothing to deliver through the binding it
+    made.  `None` -- the production default on every real door -- yields the EMPTY set, so
+    the real runtime stays fail-closed BY CONSTRUCTION rather than by remembering to pass
+    nothing.
+
+    BOTH readers call this one function over the same driver object:
+
+    * `OrcaRuntimeHarness.bind_prepared_target()` -- the PREPARATION GATE (OS-14 I-7).
+      When HC does not hold it mints no hosted launch cell at all, so the sessions it
+      prepares are GENUINELY legacy and take today's delivery path because they carry no
+      hosted cell, not because a capability was re-read at delivery time;
+    * the hosted delivery branch's DELIVERABILITY test (OS-14 I-8, NOT in this release).
+
+    **HC is never a RECOGNITION input** (design correction F-002).  On a target that
+    already carries a hosted launch cell, an absent or incomplete HC is a hosted
+    deliverability FAILURE and therefore a named refusal -- never a demotion to the
+    legacy `worker-start` / `terminal send` path, which would write the task into the
+    supervisor shim's stdin and leave the model never receiving it.  That rule lives with
+    I-8; what lives here is only the derivation both sides read.
+    """
+    if callable(getattr(driver, "deliver_hosted", None)) and callable(
+            getattr(driver, "bind_target", None)):
+        return frozenset({HOSTED_DELIVERY_CAPABILITY})
     return frozenset()
 
 

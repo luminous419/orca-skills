@@ -3,12 +3,17 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import secrets
 import shlex
 import shutil
+import socket
 import subprocess
+import tempfile
+import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,11 +56,13 @@ try:
         MODEL_EVIDENCE_UNVERIFIABLE,
         MODEL_EVIDENCE_VERIFIED,
         EVENT_AGENT_IDENTITY_BOUND,
+        HOSTED_DELIVERY_CAPABILITY,
         MODEL_SELECTION_VERIFIED_CAPABILITY,
         MODEL_TOKEN_PATTERN,
         REASON_WORKER_REVIEWER_MUST_DIFFER,
         driver_type_id,
         effective_identity_independent,
+        hosted_delivery_capabilities,
         model_selection_capabilities,
     )
     from scripts.deterministic_workflow import quiescence, turn_boundary
@@ -95,11 +102,13 @@ except ModuleNotFoundError:  # direct `python3 scripts/...` execution
         MODEL_EVIDENCE_UNVERIFIABLE,
         MODEL_EVIDENCE_VERIFIED,
         EVENT_AGENT_IDENTITY_BOUND,
+        HOSTED_DELIVERY_CAPABILITY,
         MODEL_SELECTION_VERIFIED_CAPABILITY,
         MODEL_TOKEN_PATTERN,
         REASON_WORKER_REVIEWER_MUST_DIFFER,
         driver_type_id,
         effective_identity_independent,
+        hosted_delivery_capabilities,
         model_selection_capabilities,
     )
     from deterministic_workflow import quiescence, turn_boundary
@@ -985,6 +994,451 @@ class ModelSelectionTicket:
     token: str
     #: Single-use window.  Raises once the barrier revokes the ticket.
     stamp: Callable[[], int]
+    # ---- OS-14 I-1: the LAUNCH LEASE this attempt is a call ON --------------------
+    # Additive, defaulted, and read-only to the driver: they tell a conforming driver
+    # WHICH launch it is being asked to re-validate, so it can cite that launch instead
+    # of presenting a call that performed no launch as a new selection REQUEST (D2).
+    # "" / 0 mean NO LEASE -- a legacy run, or a driver that is not hosted-capable --
+    # and in that state the barrier's launch leg is a no-op, so every pre-OS-14
+    # construction of this dataclass and every pre-OS-14 driver behaves unchanged.
+    launch_token: str = ""
+    launch_stamp: int = 0
+
+
+#: OS-14 I-1.  The launch lease's three REFUSAL names.  They are DRIVER-LOCAL target
+#: states, not members of the model-selection failure vocabulary: each one is REPORTED
+#: through an EXISTING member (`model_selection_unverified` / `_request_stale` /
+#: `_request_absent`), and none of them is ever repaired by rebinding.  Named here so the
+#: three distinct facts stay distinguishable in a diagnostic while the closed vocabulary
+#: stays closed -- I-10, not this release, is what adds a member.
+DRIVER_TARGET_UNBOUND = "DRIVER_TARGET_UNBOUND"
+DRIVER_TARGET_REBOUND = "DRIVER_TARGET_REBOUND"
+DRIVER_BIND_UNCONFIRMED = "DRIVER_BIND_UNCONFIRMED"
+DRIVER_TARGET_FAILURE_NAMES = (DRIVER_TARGET_UNBOUND, DRIVER_TARGET_REBOUND,
+                               DRIVER_BIND_UNCONFIRMED)
+
+def pair_terminal_digest(handle: str) -> str:
+    """``sha256(handle)`` -- the ONE derivation, spelled to agree with
+    ``deterministic_workflow.pause_policy.terminal_digest`` byte for byte.
+
+    Re-spelled here rather than imported for the reason every other duplication in this
+    module is: this module is the RUNTIME and takes no engine-package import at module
+    scope.  ``scripts/test_os14_launch_lease.py`` asserts the two derivations are equal
+    for the same handle, so the duplication cannot drift.
+    """
+    return hashlib.sha256(handle.encode("utf-8")).hexdigest()
+
+
+def endpoint_path_fits(path: str) -> bool:
+    """Does this platform's OWN ``sun_path`` accept a path of this length?
+
+    Asked of the platform rather than compared against a constant, because the budget is
+    104 bytes on the macOS build this design was measured on and 108 on Linux, and a
+    constant taken from a design document is wrong on one of them.
+
+    The probe is ``connect()``, not ``bind()``, and that choice is what makes it SAFE to
+    run on every mint: CPython's own ``AF_UNIX`` address conversion rejects an over-long
+    path with ``"AF_UNIX path too long"`` -- using ``sizeof(addr.sun_path)`` -- BEFORE any
+    syscall runs, so an over-long path is refused without touching the filesystem, and a
+    path whose length is ACCEPTED fails later and harmlessly with ``ENOENT`` /
+    ``ECONNREFUSED`` because nothing is listening.  Nothing is created, nothing is
+    unlinked, and no listener is disturbed.
+
+    A platform with no ``AF_UNIX`` at all answers ``False``: an unavailable address family
+    is an unnarrowed limit, not a licence to compose a path nothing could bind.
+    """
+    family = getattr(socket, "AF_UNIX", None)
+    if family is None:                  # pragma: no cover - non-POSIX hosts only
+        return False
+    probe = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        probe.connect(path)
+    except OSError as exc:
+        # `safe_exception_text`, not an eager `str(exc)`: this module's standing rule is
+        # that a caught exception is never rendered eagerly, and the rule is structural
+        # rather than per-site (OS-49 review F-001/F-003).  CPython reports an over-long
+        # `AF_UNIX` address with its own message and NO errno, so the text really is the
+        # discriminator here and `errno` alone cannot be it.
+        reported = safe_exception_text(exc).lower()
+        if exc.errno == errno.ENAMETOOLONG or "too long" in reported:
+            return False
+        return True                     # the LENGTH was accepted; the peer is a detail
+    finally:
+        probe.close()
+    return True                         # something is already listening: it fits
+
+
+def _utc_now() -> str:
+    """One ISO-8601 UTC timestamp, for the lease's revocation stamp."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+#: OS-14 I-1.  The control-endpoint path's fixed parts.  The path is DERIVED from the
+#: launch token and never discovered, never announced on a terminal and never read back
+#: with `terminal read`; only its DIGEST reaches an artifact or a log.
+LAUNCH_ENDPOINT_DIRNAME = "os14"
+
+
+@dataclass(frozen=True)
+class ModelLaunchLease:
+    """ONE external `terminal create` that this harness is about to perform, pre-recorded.
+
+    Minted by the HARNESS -- never by a caller, never by a driver -- strictly BEFORE the
+    create effect, and the thing every later driver call on that session must CITE.  It is
+    the request leg of OS-14's D2: the first launch is the act that selects a model, and
+    every call after it RE-VALIDATES that launch rather than performing a new one.  A call
+    that performed no new launch and no new model selection must never be presented as a
+    new selection request, and the token is what makes the difference checkable by the
+    harness instead of trusted from the driver.
+
+    Four separate mechanisms, deliberately kept apart, exactly as `ModelSelectionTicket`
+    keeps `token` and `stamp` apart:
+
+    * `launch_token` is the launch's IDENTITY and its CAPABILITY: a run-scoped random
+      value this harness issued once.  No previous launch, no other session and no
+      pre-existing CLI process can hold it, because it did not exist until the mint.  It
+      is also what the endpoint path is derived from, so two leases can never collide on
+      one path;
+    * `launch_stamp` is the launch's ORDER: an ordinal drawn from the SAME private
+      monotone counter the verification tickets draw from.  So "the launch happened before
+      the verification that cites it" is integer arithmetic over values this harness
+      issued, not a claim a driver makes about itself;
+    * `terminal_digest` is the launch's TARGET, and it is deliberately EMPTY until the
+      create receipt has been observed.  The handle does not exist before `terminal
+      create` returns, so no frame authored by the launched process can carry it -- the
+      harness holds the receipt and binds it, which is the only non-circular order;
+    * `revoked_at` is the launch's END.  A revoked lease is never re-exercised, and
+      revocation is the authoritative "this endpoint is finished" fact -- not the socket
+      file, whose inode identity nothing here relies on.
+
+    **The mint rule (design 3a.12), which this dataclass exists to make checkable: ONE
+    lease per `terminal create`, never re-exercised by a second create.** The first
+    create, a confirmed `CREATE_REFUSED` retry and a reuse-gate supersession each mint a
+    NEW token and revoke the superseded one.  There is no "re-exercise the recorded lease
+    across a create" path at all.
+
+    **Never authority.** A lease read back from a durable record proves that a launch was
+    once INTENDED.  It does not restore a live binding and it does not restore a
+    verification authority: a durable lease whose channel this process does not hold is
+    `DRIVER_TARGET_UNBOUND`, which is a refusal, never a rebind.
+    """
+
+    run_id: str
+    role: str
+    phase: str
+    attempt: int
+    create_attempt: int
+    requested_model: str
+    agent_command: str
+    launch_token: str
+    launch_stamp: int
+    session_uuid: str
+    endpoint_path: str
+    endpoint_digest: str
+    launch_argv_digest: str
+    #: Bound at `CREATED`, after the create receipt is observed.  "" means UNBOUND.
+    terminal_digest: str = ""
+    #: Set at revocation.  "" means LIVE.
+    revoked_at: str = ""
+
+    @property
+    def bound(self) -> bool:
+        return bool(self.terminal_digest)
+
+    @property
+    def revoked(self) -> bool:
+        return bool(self.revoked_at)
+
+    def durable_cells(self) -> dict[str, str]:
+        """The five cells the `CREATE_INTENDED` write publishes, as the store spells them.
+
+        `terminal_digest` is NOT here: the adapter writes it one stage later, at
+        `CREATED`, out of the create receipt it holds.  `launch_revoked_at` is not here
+        either -- a lease is never born revoked.
+        """
+        return {"launch_token": self.launch_token,
+                "launch_stamp": str(self.launch_stamp),
+                "session_uuid": self.session_uuid,
+                "endpoint_digest": self.endpoint_digest,
+                "launch_argv_digest": self.launch_argv_digest}
+
+
+# ---- OS-14 I-7: the ONE target-lifetime rule, TL (design 3a.12.1) --------------------
+#: A role's target has FOUR states for one gate round, and only ONE of them can ever
+#: permit a release.  The state is a property of the role's LATEST settlement for the
+#: round's key, not of the handle.
+TARGET_ACTIVE = "ACTIVE"
+TARGET_SETTLED_PENDING_VALIDATION = "SETTLED_PENDING_VALIDATION"
+TARGET_REPAIR_PENDING = "REPAIR_PENDING"
+TARGET_VALIDATED = "VALIDATED"
+TARGET_STATES = (TARGET_ACTIVE, TARGET_SETTLED_PENDING_VALIDATION,
+                 TARGET_REPAIR_PENDING, TARGET_VALIDATED)
+
+#: The two ROUTE tokens that keep a round OPEN, and the whole of clause (1b).
+#: `PREPARE_REPAIR` re-dispatches THIS role into the same phase, the same gate iteration
+#: and the same round; `PREPARE_PHASE_REVIEWER` dispatches ANOTHER ROLE OF THIS SAME
+#: round.  Every other member of `contracts.RouteToken` is a CLOSING token.  Spelled as
+#: the two that keep it open rather than as the eleven that close it, so a token added to
+#: the engine later closes rounds by default instead of silently never closing one.
+ROUND_OPEN_ROUTE_TOKENS = ("PREPARE_REPAIR", "PREPARE_PHASE_REVIEWER")
+
+
+#: The phase a FINAL REVIEW round's contract is rendered with.  Spelled here rather than
+#: imported for the reason every other duplication in this module is: this module takes no
+#: engine-package import at module scope.  `test_os14_round_lifetime` asserts it equals
+#: `deterministic_workflow.artifact_identity.FINAL_REVIEW_PHASE`.
+FINAL_REVIEW_ROUND_PHASE = "final_review"
+
+
+def round_required_roles(risk: str, *, phase: str = "") -> tuple[str, ...]:
+    """The roles ONE GATE ROUND cannot finish without -- NOT the roles dispatched so far.
+
+    This is the set clause (1a) of TL quantifies over, and the predicate is wrong without
+    it: immediately after an accepted Worker turn every role *dispatched so far* is
+    validated, while at HIGH/MEDIUM risk the phase Reviewer still has to run on both held
+    targets.  That is the F-001 defect, and quantifying over REQUIRED roles is the fix.
+
+    It is the ENGINE's own rule, read off `routing.phase_gate` and not invented here:
+
+    * `risk == "low"`  -> `phase_gate` returns `PASS` from a `COMPLETE` worker result
+      alone (`if state["risk"] == "low": return "PASS"`), and ROUTE then emits
+      `ADVANCE_PHASE`.  No phase Reviewer is ever prepared or dispatched, so none is
+      required;
+    * otherwise -> past that same line `phase_gate` reads `reviewer_result` and returns
+      `PENDING` while it is `None`, so the round cannot advance without a Reviewer result.
+      The phase Reviewer is REQUIRED whether or not it has been dispatched yet, and a
+      Reviewer that is PREPARED BUT NOT YET DISPATCHED is required and `ACTIVE`.
+
+    An unknown or absent `risk` is treated as the STRICTER set -- both roles required --
+    for the same reason every other unanswered question in this tree is: an undeclared
+    fact is unknown, not "low".
+
+    **`phase` names the round, and a FINAL REVIEW round is governed by a different gate.**
+    `routing.final_gate` returns `PENDING` until `final_reviewer_result` exists and reads
+    no worker or phase-reviewer result at all, so the one role a final-review round cannot
+    finish without is the **Final Reviewer** -- at every risk level. Quantifying such a
+    round over `worker`/`reviewer` would make its close unsatisfiable and report every
+    completed run's last round as a disposal rather than as the validated completion it is.
+    Nothing is ever PREPARED for a final-review round (the Final Reviewer is deliberately
+    outside the pair rule), so the release set is empty either way; what the distinction
+    fixes is the CLAUSE, and TL's two clauses are not interchangeable.
+
+    `phase` defaults to `""` so every caller that means "this run's gate round" keeps the
+    rule above unchanged.
+    """
+    if str(phase or "").lower() == FINAL_REVIEW_ROUND_PHASE:
+        return ("final_reviewer",)
+    return ("worker",) if str(risk or "").lower() == "low" else ("worker", "reviewer")
+
+
+class RoundTargetLifetime:
+    """TL: when a prepared hosted target, its channel and its lease are disposed of.
+
+    **This class owns no routing and makes no repair decision.** `VALIDATION_REPAIR`,
+    `PHASE_GATE` and `CORRECTION_LOOP` are in `graph_spec.GRAPH_OWNED_DECISIONS` and stay
+    there; this object only OBSERVES the token the engine already emitted and the
+    settlement verdicts the engine already classified, and converts them into one answer:
+    is this round over, and therefore may its targets be released.
+
+    The rule, exactly as the design states it once:
+
+        A hosted target's channel and lease are held from its `CREATED` write until the
+        gate ROUND that prepared it CLOSES.  The round is one `(phase, gate iteration)`
+        key together with EVERY graph turn the engine runs under it -- the Worker's turn,
+        the phase-Reviewer's turn, and every validation-repair turn of either role.
+        `release(handle)` is called for every handle prepared under that key, EXACTLY
+        ONCE, at round close.  It is idempotent.
+
+    A round closes on the FIRST of:
+
+    1. **validated completion**, which is BOTH of
+       * **(1a)** every role REQUIRED BY THIS ROUND (`round_required_roles`, from the
+         run's `risk`) has reached `VALIDATED`.  A required role that is `ACTIVE`,
+         `SETTLED_PENDING_VALIDATION` or `REPAIR_PENDING` -- including one that has been
+         prepared but never dispatched, and including one with no recorded state at all --
+         makes this FALSE; and
+       * **(1b)** the token ROUTE emitted is neither `PREPARE_REPAIR` (re-dispatches this
+         role) nor `PREPARE_PHASE_REVIEWER` (dispatches another role of this same round).
+    2. **refusal or abandonment** -- `dispose()`: any `_refuse_preparation` on this key, a
+       Gate B refusal, a delivery failure that re-raises out of `start_worker`, a
+       `CANCEL`/`ABANDON` disposition, a `PAUSE`, or the run leaving this key for any
+       other reason.
+
+    **Why it is not "after settlement", and why that is not a preference.** `settle_attempt`
+    runs inside EXECUTE_INTENT; a malformed decision-gate record is classified one node
+    LATER, in VALIDATE_SETTLEMENT; and ROUTE may then re-dispatch THE SAME ROLE under THE
+    SAME KEY.  `OrcaAdapter._prepare_pair` verifies BOTH roles UNCONDITIONALLY on EVERY
+    pass, so the Reviewer's turn -- and every repair turn -- re-verifies the SETTLED
+    Worker's own session.  A settlement-scoped release tears down exactly the target the
+    next turn of the same round is about to re-verify, and the measured consequence is
+    `PAIR_PREPARATION_MODEL_UNOBSERVED`.
+
+    **Three implementations this class must NOT be.** Each of them passes a naive reading
+    and fails the round: one that releases at `settle_attempt` (releases what a validation
+    repair is about to need); one that releases on `VALIDATED` ALONE, with no (1b)
+    (releases while a repair is pending, and releases the pair the moment the Worker's
+    form is accepted); and one whose (1a) quantifies over DISPATCHED roles instead of
+    REQUIRED ones (releases both handles right after the accepted Worker turn, before the
+    required Reviewer has run).
+
+    **What TL does NOT do.** It does not touch Dispatch settlement, current model
+    authority or Orca's dispatch capability -- Orca revokes the dispatch capability at
+    settlement and TL has no claim on it.  It moves exactly one lifetime,
+    target/channel/lease, from settlement-scoped to round-scoped.  It never carries
+    anything ACROSS rounds: a new `(phase, attempt)` key is a fresh session and a fresh
+    lease.  It does not decide whether a repair REUSES the held session -- the shipped
+    reuse gate does, through its one production consumer, and TL only removes the reason
+    the gate could never have been asked.  And it assumes NO cleanup on Coordinator
+    process exit: this object is in-process state that dies with the process, the
+    surviving CLI child is the operator's residual, and a successor refuses the durable
+    lease rather than rebinding it.
+    """
+
+    def __init__(self, release: Callable[[str], None], *, risk: str = "") -> None:
+        self._release = release
+        self.risk = risk
+        #: (phase, attempt) -> {role: handle}.  Per-KEY, so a target prepared under one
+        #: round key is never observable under another.
+        self._prepared: dict[tuple[str, str], dict[str, str]] = {}
+        #: (phase, attempt) -> {role: state}
+        self._states: dict[tuple[str, str], dict[str, str]] = {}
+        #: keys whose round has already closed; a second close releases nothing more.
+        self._closed: set[tuple[str, str]] = set()
+        #: handles released by THIS object, in call order, with their round key.
+        self.releases: list[tuple[tuple[str, str], str]] = []
+
+    # ---- the key ---------------------------------------------------------------------
+    @staticmethod
+    def round_key(phase: Any, attempt: Any) -> tuple[str, str]:
+        """One `(phase, gate iteration)` pair, as strings, so `1` and `"1"` are one key."""
+        return (str(phase), str(attempt))
+
+    # ---- what the engine tells this object -------------------------------------------
+    def prepared(self, *, phase: Any, attempt: Any, role: str, handle: str) -> None:
+        """A target was prepared for `role` under this key: state `ACTIVE`.
+
+        Idempotent for the same handle.  A DIFFERENT handle for the same (key, role) is a
+        supersession -- the superseded handle keeps its place in the key's prepared set,
+        because the release count is per HANDLE ACTUALLY PREPARED, and a superseded
+        session still had one.
+
+        **The state is set only when this role has none yet for this key**, and that is
+        the design's own rule rather than an optimisation: *"the state is a property of the
+        role's LATEST SETTLEMENT for this key, not of the handle"*.  `_prepare_pair`
+        verifies and therefore re-prepares BOTH roles on EVERY pass, so a validation-repair
+        turn re-prepares a counterpart whose settlement was already `VALIDATED`; resetting
+        it to `ACTIVE` would make the round's eventual close read as clause 2 (the engine
+        left the key) when it is really clause 1 (the round's work finished).  Neither
+        reading releases differently -- `ACTIVE` permits no release either -- but the
+        reported clause would be wrong, and TL's two clauses are not interchangeable.
+        """
+        key = self.round_key(phase, attempt)
+        prepared = self._prepared.setdefault(key, {})
+        previous = prepared.get(role)
+        if previous is not None and previous != handle:
+            prepared[f"{role}#superseded:{previous}"] = previous
+        prepared[role] = handle
+        self._states.setdefault(key, {}).setdefault(role, TARGET_ACTIVE)
+        self._closed.discard(key)
+
+    def settled(self, *, phase: Any, attempt: Any, role: str) -> None:
+        """`settle_attempt` has run for this role's Dispatch inside EXECUTE_INTENT and
+        VALIDATE_SETTLEMENT has not yet classified the result.
+
+        **This state exists so that settlement is not mistaken for completion.** A
+        settlement whose FORM nobody has checked yet is not a finished role, and no
+        release is permitted here.
+        """
+        self._states.setdefault(self.round_key(phase, attempt), {})[role] = (
+            TARGET_SETTLED_PENDING_VALIDATION)
+
+    def repair_pending(self, *, phase: Any, attempt: Any, role: str) -> None:
+        """VALIDATE_SETTLEMENT produced a FORM defect and ROUTE returned `PREPARE_REPAIR`
+        for this same role / phase / round.  No release: the repair's own EXECUTE_INTENT
+        re-runs `OrcaAdapter.start`, whose step 4f re-verifies BOTH roles."""
+        self._states.setdefault(self.round_key(phase, attempt), {})[role] = (
+            TARGET_REPAIR_PENDING)
+
+    def validated(self, *, phase: Any, attempt: Any, role: str) -> None:
+        """VALIDATE_SETTLEMENT produced NO pending gate defect for this role's settlement
+        -- the result's FORM was accepted.  Release is permitted only TOGETHER WITH the
+        close condition, never on this alone."""
+        self._states.setdefault(self.round_key(phase, attempt), {})[role] = (
+            TARGET_VALIDATED)
+
+    # ---- what this object answers -----------------------------------------------------
+    def role_state(self, *, phase: Any, attempt: Any, role: str) -> str:
+        """This role's state for this key.  A role with nothing recorded reads `ACTIVE`:
+        an unanswered question is unknown, not finished."""
+        return self._states.get(self.round_key(phase, attempt), {}).get(
+            role, TARGET_ACTIVE)
+
+    def prepared_handles(self, *, phase: Any, attempt: Any) -> tuple[str, ...]:
+        """Every handle actually prepared under this key, deduplicated, in prepare order."""
+        seen: dict[str, None] = {}
+        for handle in self._prepared.get(self.round_key(phase, attempt), {}).values():
+            seen.setdefault(handle, None)
+        return tuple(seen)
+
+    def required_roles(self, phase: str = "") -> tuple[str, ...]:
+        """This run's required-role set, for a round in `phase`.
+
+        `phase` is optional and defaults to the run's own gate rounds; a FINAL REVIEW
+        round answers with the Final Reviewer alone, because that is the role
+        `routing.final_gate` will not let it finish without.
+        """
+        return round_required_roles(self.risk, phase=phase)
+
+    def round_closes(self, token: str, *, phase: Any, attempt: Any) -> bool:
+        """CLAUSE 1, and clause 1 only: `(1a) AND (1b)`.
+
+        Clause 2 is `dispose()` and is NOT evaluated here -- a refusal or an abandonment
+        closes a round whatever the role states say, and writing it as a predicate over
+        (1a)/(1b) is exactly the conflation the design's test row forbids.
+        """
+        if token in ROUND_OPEN_ROUTE_TOKENS:                       # (1b)
+            return False
+        return all(                                                # (1a)
+            self.role_state(phase=phase, attempt=attempt, role=role) == TARGET_VALIDATED
+            for role in self.required_roles(str(phase)))
+
+    # ---- the two things that actually release ------------------------------------------
+    def observe_route(self, token: str, *, phase: Any, attempt: Any) -> tuple[str, ...]:
+        """Observe the token ROUTE emitted; release this key's handles iff clause 1 holds.
+
+        Returns the handles released by THIS call -- empty on every held path.  Observing
+        a closing token twice releases nothing the second time: the count TL asserts is
+        one release per handle actually prepared, and this object, not the caller, is what
+        makes that true.
+        """
+        if not self.round_closes(token, phase=phase, attempt=attempt):
+            return ()
+        return self._close(phase=phase, attempt=attempt)
+
+    def dispose(self, *, phase: Any, attempt: Any, reason: str = "") -> tuple[str, ...]:
+        """CLAUSE 2: a refusal, a Gate B failure, a delivery failure, a cancel, an abandon
+        or a pause.  Releases every handle prepared under the key, exactly once.
+
+        A refusal raised BEFORE any create has nothing to release, and this returns `()`
+        for it rather than inventing a handle to tidy up.
+        """
+        del reason                      # named for the caller's clarity; not interpreted
+        return self._close(phase=phase, attempt=attempt)
+
+    def _close(self, *, phase: Any, attempt: Any) -> tuple[str, ...]:
+        key = self.round_key(phase, attempt)
+        if key in self._closed:
+            return ()
+        self._closed.add(key)
+        released: list[str] = []
+        for handle in self.prepared_handles(phase=phase, attempt=attempt):
+            self.releases.append((key, handle))
+            released.append(handle)
+            self._release(handle)
+        return tuple(released)
+
+    def release_count(self, handle: str) -> int:
+        return sum(1 for _, released in self.releases if released == handle)
 
 
 @dataclass(frozen=True)
@@ -1021,6 +1475,18 @@ class ModelEvidence:
     observed_at_role: str = ""
     observed_at_phase: str = ""
     observed_at_attempt: int = 0
+    # ---- OS-14 I-1: the LAUNCH leg, attested ---------------------------------------
+    # The design's P-7 adds these two fields together with three vocabulary MEMBERS.
+    # The members are I-10 and are deliberately NOT in this release (adding a request
+    # method early makes an unauthorised path look eligible); these two FIELDS are,
+    # because the barrier's launch leg (a2) has nothing to validate without a citation
+    # to validate, and a leg that cannot be exercised is not a protection.
+    #
+    # Additive with ""/0 defaults, exactly as `ReuseObservation` and `RuntimeAttempt`
+    # do it, so every existing construction binds unchanged and every existing driver
+    # keeps producing evidence this barrier accepts on a run with no lease.
+    launch_token: str = ""
+    launch_stamp: int = 0
 
     @property
     def request_evidence(self) -> str:
@@ -1475,6 +1941,34 @@ class OrcaRuntimeHarness:
         # driver that keeps the ticket and stamps later gets an error rather than a
         # usable ordinal from the NEXT attempt's window.
         self._model_selection_open_tokens: set[str] = set()
+        # ---- OS-14 I-1: the LAUNCH LEASE registry, per harness -----------------------
+        # launch_token -> the lease.  DRIVER-LOCAL and IN-PROCESS on purpose: the
+        # design's restart rule is a NAMED REFUSAL, so there is deliberately nothing
+        # durable to resurrect a binding from.  A successor process starts with this map
+        # empty, finds a durable lease it does not hold, and refuses
+        # `DRIVER_TARGET_UNBOUND` -- it never rebinds.
+        self._launch_leases: dict[str, ModelLaunchLease] = {}
+        # terminal handle -> launch_token, written at the `CREATED` bind and ONLY there.
+        self._launch_lease_handles: dict[str, str] = {}
+        # launch_token -> the live target object the driver bound, if any.  A SECOND bind
+        # for one handle, or a bind whose identity differs, is `DRIVER_TARGET_REBOUND`
+        # and mints no second nonce.
+        self._launch_bindings: dict[str, Any] = {}
+        # The bind nonce, minted ONCE PER LEASE and held in memory only -- never durable,
+        # never an identity a durable record could restore.
+        self._launch_bind_nonces: dict[str, str] = {}
+        # terminal handle -> the launch token it held when it was RELEASED.  Kept so a
+        # released session is REFUSED rather than silently read as legacy: dropping the
+        # handle from `_launch_lease_handles` alone would make a later verification of it
+        # take the no-lease path, which is the one reading a released target must never
+        # get.  A released handle is finished with, and saying so is a refusal.
+        self._launch_released_handles: dict[str, str] = {}
+        # The DURABLE lease reader, wired by the adapter that owns the preparation
+        # document: (role, phase, attempt) -> the recorded cells, or None.  `None` here
+        # means this harness cannot consult the durable record at all, and the launch leg
+        # treats that as REQUEST ABSENT whenever a citation is made: a lease that exists
+        # only in this process's memory is never sufficient evidence of a launch.
+        self._launch_lease_reader: Callable[..., dict[str, Any] | None] | None = None
         # terminal handle -> the accepted evidence awaiting rebinding to a dispatch id.
         # The Dispatch does not exist yet when the barrier runs on rung 3 (the very call
         # that delivers creates it), so the evidence is keyed on the handle here and
@@ -3304,6 +3798,281 @@ class OrcaRuntimeHarness:
             row["tui_idle"] = state
         return state
 
+    # ---- OS-14 I-1 / I-7: the launch lease and the round-scoped target ---------------
+
+    def set_launch_lease_reader(
+            self, reader: Callable[..., dict[str, Any] | None] | None) -> None:
+        """Wire the DURABLE lease reader this harness consults at the launch leg.
+
+        The preparation document belongs to the adapter, and this module takes no engine
+        import, so the adapter hands in a reader instead.  Keyword call signature
+        `(role=..., phase=..., attempt=...)`, returning the recorded cells or `None`.
+
+        Leaving it unwired is FAIL-CLOSED, not permissive: with no reader the launch leg
+        cannot confirm that a cited lease was ever durably recorded, and an unconfirmable
+        citation is `model_selection_request_absent`.
+        """
+        self._launch_lease_reader = reader
+
+    def hosted_delivery_capable(self) -> bool:
+        """The rule HC, read through its ONE derivation, over THIS run's driver object.
+
+        `agent_profile.hosted_delivery_capabilities` is the single definition: the
+        capability exists iff `deliver_hosted` AND `bind_target` are both callable.  This
+        method is a thin read of it so the two call sites that must never disagree --
+        `mint_launch_lease` (the preparation gate) and `bind_prepared_target` (the
+        post-create bind) -- cannot acquire a second spelling between them.  `None`, the
+        production default, yields the empty set and therefore `False`.
+        """
+        return HOSTED_DELIVERY_CAPABILITY in hosted_delivery_capabilities(
+            self.model_driver)
+
+    def launch_endpoint_path(self, launch_token: str) -> str:
+        """`<state_dir>/os14/<run_id>/<sha256(launch_token)[:16]>.sock`, DERIVED.
+
+        Never discovered, never announced on a terminal and never read back with
+        `terminal read`.  `state_dir` is `$XDG_RUNTIME_DIR` when set and the platform
+        temporary directory otherwise -- NEVER inside the repository or a worktree -- and
+        only the path's DIGEST is ever recorded in a durable cell, an artifact or a log.
+
+        The length is asserted against the PLATFORM's own `sun_path` budget, read from
+        `socket` rather than taken as a constant from the design: the budget is 104 bytes
+        on the build this was measured on and 108 on Linux, and a design constant would be
+        wrong on one of them.  The refusal happens here, before anything binds.
+        """
+        state_dir = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+        path = os.path.join(state_dir, LAUNCH_ENDPOINT_DIRNAME, self.run_id or "",
+                            f"{hashlib.sha256(launch_token.encode()).hexdigest()[:16]}"
+                            ".sock")
+        if not endpoint_path_fits(path):
+            raise OrcaRuntimeError(
+                "LAUNCH_ENDPOINT_PATH_TOO_LONG: this platform refused the derived "
+                f"control-endpoint path's LENGTH ({len(path.encode())} bytes) before any "
+                "address was used, so it could never be bound; refusing here, before any "
+                "effect.  The path itself is deliberately not reported -- only its length "
+                "-- because only its digest may reach an artifact or a log")
+        return path
+
+    def mint_launch_lease(self, *, role: str, phase: str, attempt: Any,
+                          create_attempt: int = 1,
+                          supersedes: str = "") -> "ModelLaunchLease | None":
+        """Mint ONE lease for the `terminal create` that is about to happen.
+
+        Called by the preparation path STRICTLY BEFORE the external create effect, from
+        inside the `CREATE_INTENDED` statement group that already runs there -- so the
+        durable record of the launch INTENT precedes the launch, and a crash in that
+        window leaves a recorded intent rather than an unexplained session.
+
+        **Gated on HC, and that gate is the fail-closed default.** With no hosted-capable
+        driver this returns `None`, mints nothing, records nothing and derives no endpoint
+        path: the session the caller then prepares is GENUINELY legacy, carries no hosted
+        launch cell, and takes today's delivery path because there is nothing hosted about
+        it to recognise -- not because a capability was re-read later and found wanting.
+
+        **The mint rule.** One lease per `terminal create`, never re-exercised by a second
+        create.  `supersedes` names the token this create replaces -- a confirmed
+        `CREATE_REFUSED` retry or a reuse-gate supersession -- and it is REVOKED here, in
+        the same statement group that mints the replacement, so the two can never both be
+        live.  There is no path that re-exercises a recorded token across a create.
+
+        `launch_stamp` is drawn from the SAME private monotone counter the verification
+        tickets draw from, so "the launch preceded the verification that cites it" is
+        integer order over values this harness issued.
+        """
+        if not self.hosted_delivery_capable():
+            return None
+        if supersedes:
+            self.revoke_launch_lease(supersedes, reason="superseded_by_a_new_create")
+        self._model_selection_seq += 1
+        launch_stamp = self._model_selection_seq
+        launch_token = ":".join((
+            "launch", self.run_id or "", str(phase), role, str(attempt),
+            str(create_attempt), str(launch_stamp), secrets.token_hex(16)))
+        session_uuid = str(uuid.uuid4())
+        endpoint_path = self.launch_endpoint_path(launch_token)
+        command = self.resolved_agent_command(role, phase)
+        requested_model = self.resolved_agent_model(role, phase)
+        # The digest of the launch REQUEST this lease authorises: the command, the model,
+        # the session uuid and the endpoint the composed argv would be built from.  I-3
+        # (the launch-command seam) and I-6 (the driver that composes the argv) are NOT in
+        # this release, so there is no literal argv to digest yet and this does not
+        # pretend otherwise -- it binds the lease to the four inputs an argv is composed
+        # from, which is what the barrier compares, and I-3/I-6 replace it with the digest
+        # of the argv they actually compose.  No provider syntax is invented here.
+        launch_argv_digest = hashlib.sha256("\n".join((
+            "os14.launch_request.v1", command, requested_model, session_uuid,
+            hashlib.sha256(endpoint_path.encode()).hexdigest())).encode()).hexdigest()
+        lease = ModelLaunchLease(
+            run_id=self.run_id or "", role=role, phase=str(phase), attempt=int(attempt),
+            create_attempt=int(create_attempt), requested_model=requested_model,
+            agent_command=command, launch_token=launch_token, launch_stamp=launch_stamp,
+            session_uuid=session_uuid, endpoint_path=endpoint_path,
+            endpoint_digest=hashlib.sha256(endpoint_path.encode()).hexdigest(),
+            launch_argv_digest=launch_argv_digest)
+        self._launch_leases[launch_token] = lease
+        return lease
+
+    def launch_lease(self, launch_token: str) -> "ModelLaunchLease | None":
+        """The lease this harness holds for the token, or `None`.  Never a durable read."""
+        return self._launch_leases.get(launch_token)
+
+    def launch_lease_for_handle(self, terminal: str) -> "ModelLaunchLease | None":
+        """The lease BOUND to this handle, or `None` when nothing is bound to it."""
+        token = self._launch_lease_handles.get(terminal)
+        return self._launch_leases.get(token) if token else None
+
+    def bind_launch_lease(self, launch_token: str, terminal: str) -> "ModelLaunchLease":
+        """Bind the lease to the handle the create receipt just reported (`CREATED`).
+
+        The handle does not exist before `terminal create` returns and its digest is
+        recorded only at `CREATED`, so this is the FIRST moment the lease can name its
+        target -- and the harness, which holds the receipt, is the only party that can
+        say so.  No frame authored by the launched process may carry the handle or its
+        digest; this is the non-circular order the design's O3/O4 state.
+
+        A second bind of the SAME handle to the same lease is idempotent.  A bind that
+        would move a bound lease to a different handle, or a different lease onto a handle
+        that already holds one, is `DRIVER_TARGET_REBOUND` -- refused, never repaired.
+        """
+        lease = self._launch_leases.get(launch_token)
+        if lease is None:
+            raise OrcaRuntimeError(
+                f"{DRIVER_TARGET_UNBOUND}: no lease with this token was minted by this "
+                f"harness, so there is nothing to bind to {terminal!r}; a durable record "
+                "never restores a binding")
+        if lease.revoked:
+            raise OrcaRuntimeError(
+                f"{DRIVER_TARGET_UNBOUND}: this lease was revoked at "
+                f"{lease.revoked_at!r} and a revoked lease is never re-exercised")
+        digest = pair_terminal_digest(terminal)
+        held = self._launch_lease_handles.get(terminal)
+        if held is not None and held != launch_token:
+            raise OrcaRuntimeError(
+                f"{DRIVER_TARGET_REBOUND}: {terminal!r} is already bound to another "
+                "launch lease; one handle has one target and is never re-bound")
+        if lease.bound and lease.terminal_digest != digest:
+            raise OrcaRuntimeError(
+                f"{DRIVER_TARGET_REBOUND}: this lease is already bound to another "
+                "session's digest; a lease binds one target, once")
+        bound = replace(lease, terminal_digest=digest)
+        self._launch_leases[launch_token] = bound
+        self._launch_lease_handles[terminal] = launch_token
+        return bound
+
+    def revoke_launch_lease(self, launch_token: str, *, reason: str = "") -> bool:
+        """Revoke the lease.  Idempotent; `True` iff THIS call was the revocation.
+
+        Revocation -- not the socket file's existence -- is the authoritative "this
+        endpoint is finished" fact, so nothing here relies on an inode identity and an
+        already-unlinked path is not an error.
+        """
+        lease = self._launch_leases.get(launch_token)
+        if lease is None or lease.revoked:
+            return False
+        self._launch_leases[launch_token] = replace(
+            lease, revoked_at=f"{_utc_now()}|{reason or 'revoked'}")
+        self._launch_bindings.pop(launch_token, None)
+        self._launch_bind_nonces.pop(launch_token, None)
+        return True
+
+    def bind_prepared_target(self, handle: str, *, role: str, phase: str,
+                             attempt: Any) -> str:
+        """The POST-CREATE BIND: one statement of the preparation sequence (design P-8).
+
+        Called ONCE from `OrcaAdapter._prepare_role`, immediately after the `CREATED`
+        write.  Returns `"not_hosted"`, `"bound"` or `"already_bound"`; it adds NO new
+        refusal branch, because a failed bind simply leaves the target unbound and step
+        4f's existing unconditional re-verification refuses it through
+        `PAIR_PREPARATION_MODEL_UNOBSERVED`.
+
+        **Gated on HC, by the same one derivation `mint_launch_lease` reads.** A driver
+        that can deliver but cannot bind is not hosted-capable, and neither is one that
+        can bind but cannot deliver, so a partially-capable driver prepares genuinely
+        legacy sessions rather than half-hosted ones.
+
+        The bind nonce is minted ONCE PER LEASE and is held in memory only.  A second
+        `bind_prepared_target` for one handle mints NO second nonce.
+        """
+        if not self.hosted_delivery_capable():
+            return "not_hosted"
+        lease = self.launch_lease_for_handle(handle)
+        if lease is None:
+            raise OrcaRuntimeError(
+                f"{DRIVER_TARGET_UNBOUND}: {handle!r} carries no launch lease bound by "
+                "this process, so there is no target to bind; a durable lease is not a "
+                "binding and is never rebound")
+        if lease.revoked:
+            raise OrcaRuntimeError(
+                f"{DRIVER_TARGET_UNBOUND}: {handle!r}'s lease is revoked")
+        if lease.launch_token in self._launch_bindings:
+            return "already_bound"
+        nonce = self._launch_bind_nonces.setdefault(
+            lease.launch_token, secrets.token_hex(16))
+        target = self.model_driver.bind_target(handle, lease, bind_nonce=nonce)
+        if target is None:
+            raise OrcaRuntimeError(
+                f"{DRIVER_BIND_UNCONFIRMED}: the driver returned no bound target for "
+                f"{handle!r}, so the binding is not confirmed and nothing may be "
+                "delivered on it")
+        self._launch_bindings[lease.launch_token] = target
+        return "bound"
+
+    def prepared_target(self, handle: str) -> Any:
+        """The live bound target for this handle, or `None`.  In-process state only."""
+        lease = self.launch_lease_for_handle(handle)
+        return self._launch_bindings.get(lease.launch_token) if lease else None
+
+    def release(self, handle: str) -> bool:
+        """TL's one teardown from the harness side.  IDEMPOTENT; `True` iff it did work.
+
+        Revokes the lease, drops the in-process binding, asks the driver to close its own
+        channel when it can, and removes the per-run endpoint directory when it is empty.
+        Tolerates an endpoint the launched process already unlinked -- `ENOENT` is a
+        normal outcome, because both sides unlink.
+
+        **What `release` is NOT.** It is channel and lease cleanup. It does not terminate
+        a CLI child, does not close an Orca terminal and claims no process-exit cleanup:
+        a residual session stays the operator's, under the existing residual-session
+        procedure, exactly as it is for every terminal this engine creates.
+        """
+        token = self._launch_lease_handles.get(handle)
+        if token is None:
+            return False
+        lease = self._launch_leases.get(token)
+        target = self._launch_bindings.get(token)
+        closer = getattr(self.model_driver, "release_target", None)
+        if target is not None and callable(closer):
+            try:
+                closer(handle, target)
+            except Exception:           # noqa: BLE001 - a teardown never replaces a result
+                pass
+        did = self.revoke_launch_lease(token, reason="round_close_or_refusal")
+        self._launch_lease_handles.pop(handle, None)
+        self._launch_released_handles[handle] = token
+        if lease is not None and lease.endpoint_path:
+            try:
+                os.unlink(lease.endpoint_path)
+            except OSError:
+                pass                    # already unlinked, or never bound: both are fine
+            try:
+                os.rmdir(os.path.dirname(lease.endpoint_path))
+            except OSError:
+                pass                    # not empty, or absent
+        return did
+
+    def round_target_lifetime(self, *, risk: str = "",
+                              release: Callable[[str], None] | None = None
+                              ) -> "RoundTargetLifetime":
+        """A TL tracker for one run.
+
+        `release` defaults to THIS harness's own `release(handle)`.  The adapter that owns
+        the preparation document passes a wrapper instead, because the durable
+        `launch_revoked_at` stamp a successor process reads is that document's cell and
+        this module takes no engine import -- the live half and the durable half of one
+        release therefore stay in the module that owns each.
+        """
+        return RoundTargetLifetime(release or self.release, risk=risk)
+
     # ---- OS-49 GATE B: the pre-delivery model-identity barrier ------------------------
 
     def _mint_model_selection_ticket(
@@ -3348,6 +4117,12 @@ class OrcaRuntimeHarness:
             self._model_selection_seq += 1
             return self._model_selection_seq
 
+        # OS-14 I-1.  The lease this attempt is a call ON, so a conforming driver can
+        # CITE the launch it is re-validating instead of presenting a call that performed
+        # no launch as a new selection REQUEST (D2).  Read off the handle's binding, never
+        # off anything the driver supplies: `""` / `0` when no lease was minted for this
+        # session, which is every legacy and every non-hosted-capable run.
+        lease = self.launch_lease_for_handle(terminal)
         ticket = ModelSelectionTicket(
             run_id=self.run_id or "",
             task_id=task_id,
@@ -3359,8 +4134,30 @@ class OrcaRuntimeHarness:
             requested_model=requested_model,
             token=token,
             stamp=stamp,
+            launch_token=lease.launch_token if lease is not None else "",
+            launch_stamp=lease.launch_stamp if lease is not None else 0,
         )
         return ticket, issued_at
+
+    def _durable_launch_lease(self, *, role: str, phase: str,
+                              attempt: Any) -> dict[str, Any] | None:
+        """The DURABLY RECORDED lease for this slot, through the wired reader.
+
+        `None` whenever the question cannot be answered -- no reader wired, the reader
+        raising, or the reader reporting no lease -- and the launch leg treats all three
+        the same way, as `model_selection_request_absent`.  An unanswered question is
+        unknown, never "it was fine": that is the same discipline
+        `OrcaAdapter._assert_preparation_binding` applies to a harness that cannot state
+        its own routing identity.
+        """
+        reader = self._launch_lease_reader
+        if not callable(reader):
+            return None
+        try:
+            found = reader(role=role, phase=phase, attempt=attempt)
+        except Exception:               # noqa: BLE001 - unreadable is never permission
+            return None
+        return found if isinstance(found, dict) else None
 
     def _revoke_model_selection_ticket(self, ticket: ModelSelectionTicket) -> None:
         """Close the stamp window. Called in a `finally:`, so a raising driver cannot
@@ -3441,6 +4238,13 @@ class OrcaRuntimeHarness:
                             safe_text(evidence.observed_at_attempt),
                         )
                     ),
+                    # OS-14 I-1.  The LAUNCH leg's two attested cells, rendered through
+                    # the SAME safe renderers for the same reason: they are arbitrary
+                    # objects until the type gate has proven them, the launch leg's
+                    # refusals are ABOUT them, and a diagnostic must never be able to
+                    # replace the failure it is diagnosing.
+                    f"launch_token={safe_repr(evidence.launch_token)}",
+                    f"launch_stamp={safe_text(evidence.launch_stamp)}",
                 )
             )
         else:
@@ -4160,6 +4964,11 @@ class OrcaRuntimeHarness:
             attested_observed_at_role = evidence.observed_at_role
             attested_observed_at_phase = evidence.observed_at_phase
             attested_observed_at_attempt = evidence.observed_at_attempt
+            # OS-14 I-1.  Read HERE, once, with the other attested fields and under the
+            # same read-once rule: the launch leg compares them, so they must be the
+            # values that were VALIDATED and not a second read of driver-owned state.
+            attested_launch_token = evidence.launch_token
+            attested_launch_stamp = evidence.launch_stamp
             # ---- the TYPE GATE: no leg touches a value whose TYPE is not proven ---------
             # OS-49 BUGFIX (final review F-013). F-012 canonicalized the CONTAINER; this
             # gate canonicalizes the trust in the VALUES it carries, and the two are one
@@ -4246,6 +5055,12 @@ class OrcaRuntimeHarness:
                  ATTESTED_PRIMITIVE_NOTE),
                 ("observed_at_attempt", attested_observed_at_attempt, int,
                  ATTESTED_PRIMITIVE_NOTE),
+                # OS-14 I-1.  The launch leg compares a token for equality and orders two
+                # ordinals, which are exactly the operations a hostile `__eq__` or
+                # `__lt__` would own, so both fields are proven exact `str` / `int` here
+                # with the other fifteen rather than at the leg that reads them.
+                ("launch_token", attested_launch_token, str, ATTESTED_PRIMITIVE_NOTE),
+                ("launch_stamp", attested_launch_stamp, int, ATTESTED_PRIMITIVE_NOTE),
             ):
                 if type(attested_value) is attested_type:
                     continue
@@ -4344,6 +5159,148 @@ class OrcaRuntimeHarness:
                     "order: the only way to obtain one is to call the ticket's stamp(), and "
                     "this harness counted how often it was asked",
                 )
+            # ---- leg (a2): the LAUNCH, attested (OS-14 I-1) --------------------------
+            # The design's D2 in its operative form.  The FIRST launch of a session is
+            # the act that selects a model; every later driver call on that session
+            # RE-VALIDATES that launch and performs no new one.  A call that performed no
+            # new launch must never be presented as a new selection REQUEST, so the
+            # harness checks the citation rather than trusting the driver's account of
+            # what it did.
+            #
+            # FIVE checks, and every one of them is an equality or an integer order over a
+            # value THIS HARNESS ISSUED -- no provider knowledge, no stream parsing, no
+            # trust in the driver anywhere in the leg:
+            #
+            #   (a2-1) CITATION  -- a launch is cited iff one was minted for this session,
+            #                       and the cited token is one this harness minted
+            #   (a2-2) DURABILITY-- the citation is confirmed by the DURABLE record; a
+            #                       lease that exists only in this process's memory is
+            #                       never sufficient
+            #   (a2-3) LIVENESS  -- neither the registry nor the record shows it revoked
+            #   (a2-4) TARGET    -- it is bound to THIS session and was minted for THIS
+            #                       (run, phase, role, gate iteration)
+            #   (a2-5) ORDER     -- 0 < launch_stamp == the minted stamp < request_stamp
+            #
+            # and one equality on the MODEL, which is a mismatch rather than a staleness.
+            # All six map onto EXISTING members of the closed failure vocabulary: nothing
+            # here adds a vocabulary member, and I-10 -- not this release -- is what does.
+            #
+            # A run with NO lease and an evidence that cites none skips the leg entirely,
+            # which is what keeps every legacy and reference-driver run byte-identical.
+            minted = self.launch_lease_for_handle(terminal)
+            released_token = self._launch_released_handles.get(terminal)
+            if minted is None and released_token is not None:
+                raise refuse(
+                    MODEL_SELECTION_REQUEST_STALE,
+                    "(a2-3) this session's launch lease was already RELEASED (round "
+                    "close, a refusal or a supersession), so the target it named is "
+                    "finished with.  A released target is never re-verified and never "
+                    "re-bound -- the round that owned it is over, and the next round "
+                    "prepares a fresh session with a fresh lease",
+                )
+            if minted is not None or attested_launch_token:
+                cited = self._launch_leases.get(attested_launch_token)
+                # ---- (a2-1) CITATION ----------------------------------------------
+                if not attested_launch_token or cited is None:
+                    raise refuse(
+                        MODEL_SELECTION_REQUEST_ABSENT,
+                        "(a2-1) this session was launched under a lease this harness "
+                        "minted and the evidence cites "
+                        + (f"a launch token no lease of this harness holds "
+                           f"({attested_launch_token!r})" if attested_launch_token
+                           else "no launch at all")
+                        + "; reading a model off a session whose launch nobody attested "
+                        "is not evidence that anything asked for it, and a token this "
+                        "harness never issued cannot have asked for anything.  A "
+                        "SUCCESSOR process reaches this too, and correctly: its registry "
+                        "is empty, so a durable lease it did not mint is not a launch it "
+                        "can revalidate",
+                    )
+                # ---- (a2-4) TARGET, part 1: the attempt KEY ------------------------
+                if (cited.run_id, cited.phase, cited.role, cited.attempt) != (
+                        self.run_id or "", phase, role, attempt):
+                    raise refuse(
+                        MODEL_SELECTION_REQUEST_STALE,
+                        "(a2-4) the cited launch lease was minted for "
+                        f"{(cited.run_id, cited.phase, cited.role, cited.attempt)!r} and "
+                        f"this attempt is {(self.run_id or '', phase, role, attempt)!r}: "
+                        "a launch attested for another run, round or role is not this "
+                        "attempt's request",
+                    )
+                # ---- (a2-3) LIVENESS, the registry half ---------------------------
+                if cited.revoked:
+                    raise refuse(
+                        MODEL_SELECTION_REQUEST_STALE,
+                        f"(a2-3) the cited launch lease was revoked ({cited.revoked_at!r})"
+                        "; a revoked lease is never re-exercised, by this call or any "
+                        "later one",
+                    )
+                # ---- (a2-4) TARGET, part 2: it must HAVE one ----------------------
+                if not cited.bound:
+                    raise refuse(
+                        MODEL_SELECTION_UNVERIFIED,
+                        f"(a2-4) {DRIVER_TARGET_UNBOUND}: the cited launch lease names no "
+                        "target -- its create receipt was never observed by this process, "
+                        "so nothing is bound to it.  That state is NAMED, never repaired: "
+                        "no second bootstrap is attempted and no binding is restored from "
+                        "a durable record",
+                    )
+                # ---- (a2-4) TARGET, part 3: and it must be THIS session ----------
+                if cited.terminal_digest != pair_terminal_digest(terminal):
+                    raise refuse(
+                        MODEL_SELECTION_REQUEST_STALE,
+                        f"(a2-4) the cited launch lease is bound to another session's "
+                        f"digest, not to {terminal!r}: a lease belongs to ONE physical "
+                        "session and one create, and another session's launch is never "
+                        "this session's request",
+                    )
+                # ---- (a2-2) DURABILITY --------------------------------------------
+                durable = self._durable_launch_lease(role=role, phase=phase,
+                                                     attempt=attempt)
+                if durable is None:
+                    raise refuse(
+                        MODEL_SELECTION_REQUEST_ABSENT,
+                        "(a2-2) no DURABLE record of this launch could be read for this "
+                        "(phase, gate iteration, role), so the only thing that says a "
+                        "launch happened is this process's own memory.  A registry-only "
+                        "lease is never sufficient: the durable record is written before "
+                        "the create precisely so a successor can tell this handle's "
+                        "target from a second process claiming the same session",
+                    )
+                if durable.get("launch_token") != cited.launch_token:
+                    raise refuse(
+                        MODEL_SELECTION_REQUEST_ABSENT,
+                        "(a2-2) the durable record for this (phase, gate iteration, role) "
+                        "names a different launch than the one cited, so this citation is "
+                        "not confirmed by anything outside this process",
+                    )
+                # ---- (a2-3) LIVENESS, the durable half ---------------------------
+                if durable.get("launch_revoked_at"):
+                    raise refuse(
+                        MODEL_SELECTION_REQUEST_STALE,
+                        "(a2-3) the durable record stamps this launch as revoked; a "
+                        "revoked lease is stale however live this process's memory looks",
+                    )
+                # ---- (a2-5) ORDER -------------------------------------------------
+                if not (0 < attested_launch_stamp < attested_request_stamp) or (
+                        attested_launch_stamp != cited.launch_stamp):
+                    raise refuse(
+                        MODEL_SELECTION_REQUEST_STALE,
+                        "(a2-5) the attested launch ordinal is not this lease's own "
+                        f"ordinal drawn before this attempt's request ordinal "
+                        f"(launch={attested_launch_stamp}, minted={cited.launch_stamp}, "
+                        f"request={attested_request_stamp}): the launch must PRECEDE the "
+                        "verification that cites it, and the only way to obtain either "
+                        "ordinal is to ask this harness",
+                    )
+                # ---- the MODEL equality -------------------------------------------
+                if cited.requested_model != requested:
+                    raise refuse(
+                        MODEL_SELECTION_MISMATCH,
+                        f"the cited launch lease requested {cited.requested_model!r} and "
+                        f"this routing requests {requested!r}: the session was launched "
+                        "for a different model than the one being verified",
+                    )
             observed_key = (
                 attested_observed_at_run,
                 attested_observed_at_task,
@@ -4603,6 +5560,8 @@ class OrcaRuntimeHarness:
                 observed_at_role=attested_observed_at_role,
                 observed_at_phase=attested_observed_at_phase,
                 observed_at_attempt=attested_observed_at_attempt,
+                launch_token=attested_launch_token,
+                launch_stamp=attested_launch_stamp,
             )
             self._model_identity[(phase, routing_role)] = canonical
             self._model_pending_evidence[terminal] = canonical

@@ -56,11 +56,64 @@ ALLOWED_DATA_CONSTANTS = frozenset({
 #: makes "the standalone work added no branch to workflow, decision or review policy" a
 #: gate rather than a claim.  Regenerate deliberately, never to make the test pass.
 POLICY_MODULES = ("graph.py", "routing.py", "executor.py", "state.py")
+
+
+def _excluding(source: str, ranges: tuple) -> str:
+    """`source` with the 1-based inclusive line `ranges` removed -- D4.1's POLICY REGION.
+
+    One derivation, shared by `contracts.py`'s region and by the OS-14 I-7 ranges below,
+    so the two cannot disagree about what "outside the declared ranges" means.
+    """
+    excluded = {number for first, last in ranges
+                for number in range(first, last + 1)}
+    return "".join(line for number, line in enumerate(source.splitlines(keepends=True), 1)
+                   if number not in excluded)
 POLICY_MODULE_DIGESTS = {
     "graph.py": "aeca4df8e3fa68c91bdc5d85f04e9bdb4f591272f84c87cdce3f73b38d84da9c",
     "routing.py": "b361e4fc747e39596861f78c1221d9c6c4636d4ac8a5804fa510dbbfbb509324",
     "executor.py": "f14374204745521b48c54fba6a0c8597a81cab1800762ea22acce64c6000316e",
     "state.py": "a95d370120a4a4f1191bf517a8f9f089dfc341245d17eea2322816ce1a9bd636",
+}
+
+# ---- OS-14 I-7: the ONE approved edit to two of these four modules -------------------
+#: The round-scoped target lifetime (`docs/OS-14-claude-driver-design.md` 3a.12.1 **TL**,
+#: 9.1 **I-7**) needs the deterministic engine to REPORT four facts it already owns -- a
+#: role settled, its settlement validated clean, the token ROUTE emitted, and a
+#: PAUSE/DISPOSE disposition -- to the adapter that owns target lifetime.  Those facts
+#: exist only in `executor.py`'s nodes, and the one place an observer can be bound to the
+#: pure `ROUTE` node is `graph.build_graph`, so the engine connection the OS-14 request
+#: makes first-PR scope cannot be written without editing these two files.
+#:
+#: This is handled by the SAME mechanism `contracts.py` below already uses, for the same
+#: reason and with the same protection: the edit is declared by LINE RANGE, everything
+#: outside those ranges is still pinned, and the authority is still `BASELINE_REV` rather
+#: than this ticket's output -- `test_the_policy_pins_are_the_baseline_and_not_this_tickets_
+#: output` proves the region digests below are the BASELINE's, computed from the git object.
+#:
+#: **What the ranges may contain, and what they may not.** Only observer CALL SITES: the
+#: resolver and its binding, one reported fact per node, and the signature each needed to
+#: receive the observer.  They add NO route target, NO node, NO branch on any routing,
+#: decision or review policy, and nothing per-runtime -- `routing.py` and `state.py` are
+#: untouched and still pinned byte-for-byte, and
+#: `test_policy_modules_carry_no_standalone_branch` is unchanged and still independent.
+#:
+#: ADDITIVE ranges are 1-based inclusive in the CURRENT file; SUPERSEDED ranges are the
+#: baseline lines those replaced (seven in `graph.py`, five in `executor.py` -- the import
+#: block, the five node registrations, and the five node signatures).
+POLICY_MODULE_ADDITIVE_RANGES = {
+    "graph.py": ((15, 16), (412, 417), (420, 421), (426, 428), (431, 432), (437, 438), (441, 442)),
+    "executor.py": ((68, 104), (106, 114), (116, 127), (372, 372), (391, 391), (401, 408), (509, 509), (517, 518), (522, 529), (592, 593), (601, 602), (606, 611), (693, 707), (718, 720), (738, 743), (757, 761)),
+}
+POLICY_MODULE_SUPERSEDED_RANGES = {
+    "graph.py": ((15, 15), (413, 413), (418, 419), (422, 422), (427, 427), (430, 430)),
+    "executor.py": ((68, 68), (315, 315), (443, 443), (516, 516), (608, 608)),
+}
+#: The digest of each ranged module's POLICY REGION -- the current file minus its additive
+#: ranges, which must equal the BASELINE file minus its superseded ranges.  Recorded as
+#: LITERALS so the gate needs no git, exactly as `CONTRACTS_POLICY_REGION_DIGEST` is.
+POLICY_MODULE_REGION_DIGESTS = {
+    "graph.py": "f2ba2e6139c7c64652410399653d23daa10ee362345f3138c7185a29a06777a3",
+    "executor.py": "b97f165f3feef9f845c924d6799ca33900a6843364ef0ed75c38fd9bdaf43d49",
 }
 
 #: `contracts.py`'s ADDITIVE region, by line range in the CURRENT file (1-based, inclusive)
@@ -225,11 +278,7 @@ class DriverContainmentTests(unittest.TestCase):
 
     def _policy_region(self, source: str) -> str:
         """`contracts.py` minus its additive line ranges -- D4.1's POLICY REGION."""
-        lines = source.splitlines(keepends=True)
-        excluded = {n for first, last in CONTRACTS_ADDITIVE_RANGES
-                    for n in range(first, last + 1)}
-        return "".join(line for number, line in enumerate(lines, 1)
-                       if number not in excluded)
+        return _excluding(source, CONTRACTS_ADDITIVE_RANGES)
 
     def test_policy_modules_unchanged(self) -> None:
         """DESIGN D4.1: a PINNED DIGEST over the policy modules and contracts.py's region.
@@ -245,6 +294,22 @@ class DriverContainmentTests(unittest.TestCase):
         """
         for tree in (ENGINE, MIRROR):
             for name, pinned in POLICY_MODULE_DIGESTS.items():
+                ranges = POLICY_MODULE_ADDITIVE_RANGES.get(name)
+                if ranges:
+                    # OS-14 I-7: this module carries DECLARED additive ranges, so what is
+                    # pinned is its POLICY REGION -- every byte outside them.  The region
+                    # digest is proven to be the BASELINE's by the test below, so this is
+                    # not the file asserting it equals itself.
+                    region = _excluding((tree / name).read_text(), ranges)
+                    self.assertEqual(
+                        hashlib.sha256(region.encode()).hexdigest(),
+                        POLICY_MODULE_REGION_DIGESTS[name],
+                        f"{tree.name}/{name}'s POLICY REGION changed.  Only the declared "
+                        f"OS-14 I-7 observer ranges {ranges} may differ from "
+                        f"{BASELINE_REV}; everything else is runtime-neutral policy and "
+                        "is pinned.  Re-declare a range deliberately, never to make this "
+                        "test pass")
+                    continue
                 actual = hashlib.sha256((tree / name).read_bytes()).hexdigest()
                 self.assertEqual(
                     actual, pinned,
@@ -278,6 +343,21 @@ class DriverContainmentTests(unittest.TestCase):
             self.assertEqual(
                 hashlib.sha256(shown.stdout).hexdigest(), pinned,
                 f"the pinned digest for {name} is not the one it holds at {BASELINE_REV}")
+            # OS-14 I-7: and for a module with declared additive ranges, the REGION digest
+            # the gate above compares against must be the BASELINE's region too -- the
+            # baseline file minus the lines the declared edit superseded.  This is the
+            # assertion that keeps `BASELINE_REV`, and not this ticket's output, the
+            # authority: a re-pin regenerated from a modified file fails here.
+            superseded = POLICY_MODULE_SUPERSEDED_RANGES.get(name)
+            if not superseded:
+                continue
+            baseline_region = _excluding(shown.stdout.decode("utf-8"), superseded)
+            self.assertEqual(
+                hashlib.sha256(baseline_region.encode()).hexdigest(),
+                POLICY_MODULE_REGION_DIGESTS[name],
+                f"the pinned POLICY REGION digest for {name} is not the one "
+                f"{BASELINE_REV} holds outside the superseded ranges {superseded}; the "
+                "declared ranges are hiding a change to policy")
 
         shown = subprocess.run(
             ["git", "show", f"{BASELINE_REV}:scripts/deterministic_workflow/contracts.py"],

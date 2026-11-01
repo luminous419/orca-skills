@@ -1528,9 +1528,17 @@ class ContractLockTests(unittest.TestCase):
         rows that NO entry claims -- so its missing rows would be undetectable and
         `session_use()` would be back to answering `None` for a session that was used.
         A document at any earlier version is refused outright rather than read.
+
+        OS-14 I-4 moved it a THIRD time, v3 -> v4, and this expectation moves WITH the
+        approved contract change rather than being relaxed: the entry gained the LAUNCH
+        LEASE cells, so a v3 document holds sessions whose launch this run can neither
+        confirm nor revoke.  Reading one would make a lease-less session indistinguishable
+        from a session nobody launched -- the same class of silent-empty reading the two
+        earlier bumps exist to refuse.  `test_a_v3_document_is_refused_under_the_v4_reader`
+        below is the behavioural half of this lock.
         """
         self.assertEqual(pause_store.PAIR_PREPARATION_SCHEMA_VERSION,
-                         "os14.pair_preparation.v3")
+                         "os14.pair_preparation.v4")
         self.assertEqual(pause_store.PAIR_BINDING_SCHEMA_VERSION,
                          "os14.pair_launch_binding.v2")
 
@@ -1659,6 +1667,55 @@ class PairStoreNewSectionTests(unittest.TestCase):
                                     "pairs": {}}), encoding="utf-8")
         with self.assertRaises(pause_store.PairPreparationCorrupt):
             self.store.has_any()
+
+    def test_a_v3_document_is_refused_under_the_v4_reader(self) -> None:
+        """OS-14 I-4, and the behavioural half of the schema-version lock above.
+
+        A COMPLETE, well-formed v3 document -- all three sections present, a whole v3
+        entry in ``pairs``, nothing truncated -- is refused by NAME under the v4 reader
+        and is never read as "nothing was prepared", "unused" or "no baseline yet".
+        Mirrors the v1 case above exactly, and asserts the three readings separately
+        because they are three different silent-empty answers a permissive reader gives.
+
+        Asserted too: the document on disk is UNCHANGED afterwards.  Nothing converts a
+        v3 record in place, nothing empties one, and no past in-flight run is drained --
+        the run that owns it is refused, and its record stays exactly as it was for the
+        operator who has to look at it.
+        """
+        path = pause_store.pair_preparation_path(RUN_ID, artifact_base=self.root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        v3_entry = {key: "" for key in pause_store.PAIR_ENTRY_KEYS
+                    if key not in (*pause_store.PAIR_LAUNCH_LEASE_KEYS,
+                                   "launch_revoked_at")}
+        v3_entry.update(run_id=RUN_ID, phase=PHASE, gate_iteration="1", role="worker",
+                        stage="VERIFIED", create_attempt="1",
+                        terminal_digest="d" * 64, resolved_model_observed="glm-5.2",
+                        observed_at_run=RUN_ID)
+        document = {
+            "schema_version": "os14.pair_preparation.v3",
+            "pairs": {pause_store.pair_key(PHASE, 1): {"worker": v3_entry}},
+            "sessions": {},
+            "role_history": {},
+        }
+        raw = json.dumps(document, sort_keys=True)
+        path.write_text(raw, encoding="utf-8")
+        for reading in ("has_any", "entry", "session_use", "role_history",
+                        "launch_lease"):
+            with self.subTest(reading=reading):
+                with self.assertRaises(pause_store.PairPreparationCorrupt):
+                    if reading == "has_any":
+                        self.store.has_any()
+                    elif reading == "entry":
+                        self.store.entry(PHASE, 1, "worker")
+                    elif reading == "session_use":
+                        self.store.session_use("d" * 64)
+                    elif reading == "role_history":
+                        self.store.role_history(PHASE, "worker")
+                    else:
+                        self.store.launch_lease(PHASE, 1, "worker")
+        self.assertEqual(path.read_text(encoding="utf-8"), raw,
+                         "a refused v3 document is left exactly as it was: never "
+                         "converted in place, never emptied")
 
 
 # ======================================================================================

@@ -848,7 +848,16 @@ PAIR_LAUNCH_IDENTITY_KEYS = tuple(
     key for key in PAIR_BINDING_IDENTITY_KEYS if key != "run_id")
 
 # ---- the preparation entries: WHAT was prepared for which pair ----------------------
-PAIR_PREPARATION_SCHEMA_VERSION = "os14.pair_preparation.v3"
+# OS-14 I-4.  v3 -> v4: the entry gained the LAUNCH LEASE cells below.  The bump carries
+# EXACTLY the fail-closed reading the v2 -> v3 bump has, and it is inherited rather than
+# re-implemented: `read_json_document` refuses any document whose `schema_version` is not
+# this exact string, raising `PairPreparationCorrupt`, which `OrcaAdapter` projects onto
+# `PAIR_PREPARATION_RECORD_CORRUPT`.  An older, absent-versioned, corrupt or mismatching
+# document is therefore REFUSED BY NAME and is never read as "nothing was prepared",
+# "unused" or "no baseline yet".  Nothing converts a v3 document in place, nothing empties
+# one, and no past in-flight run is drained: a v3 document stays exactly as it is on disk
+# and the run that owns it is refused rather than reinterpreted.
+PAIR_PREPARATION_SCHEMA_VERSION = "os14.pair_preparation.v4"
 PAIR_PREPARATION_FILENAME = ".pair_preparation.json"
 PAIR_PREPARATION_STAGES = ("CREATE_INTENDED", "CREATE_REFUSED", "CREATED", "VERIFIED")
 PAIR_PREPARATION_ROLES = ("worker", "reviewer")
@@ -877,9 +886,42 @@ PAIR_ENTRY_KEYS = (
     # rather than in a sibling section, so it cannot be lost INDEPENDENTLY of the entry
     # whose session it is about.
     "session_use_digests",
+    # ---- OS-14 I-4: the LAUNCH LEASE cells (design P-2, schema v3 -> v4) ------------
+    # The lease is the DURABLE pre-record of a launch INTENT, written in the
+    # `CREATE_INTENDED` call that already runs strictly before the one external effect of
+    # preparation -- so a successor process can always tell "this handle's target" from "a
+    # second process claiming the same session uuid", and can never mistake a crash in the
+    # create window for a session that was never asked for.
+    #
+    # Five cells are minted together, BEFORE the create; `terminal_digest` above is bound
+    # at `CREATED`, AFTER the create receipt is observed, because the handle does not
+    # exist until then.  `validate_pair_entry` enforces the all-or-nothing shape, so a
+    # half-written lease is corruption rather than a lease with holes.
+    #
+    # ONE LEASE PER `terminal create` (the design's mint rule): a first create, a
+    # confirmed `CREATE_REFUSED` retry and a reuse-gate supersession each mint a NEW
+    # token, and `_PAIR_ENTRY_ATTEMPT_CLEARED` below clears every one of these cells when
+    # a new create attempt is published, so a recorded token can never be re-exercised by
+    # a second create.
+    #
+    # These cells are HISTORY of an intent, never AUTHORITY: nothing reads them to decide
+    # that a live binding or a verification exists.  A durable lease with no live channel
+    # is a named refusal (`DRIVER_TARGET_UNBOUND`), never a rebind.
+    "launch_token",            # the harness-minted capability this run's driver calls cite
+    "launch_stamp",            # decimal string; the `_model_selection_seq` ordinal of the
+                               # mint, so a launch provably precedes its own verification
+    "session_uuid",            # the CLI `--session-id` the launch argv was composed with
+    "endpoint_digest",         # sha256 of the control endpoint path -- NEVER the path
+    "launch_argv_digest",      # sha256 of the composed launch argv -- NEVER the argv
+    "launch_revoked_at",       # set once the lease is revoked; a revoked lease is stale
     "recorded_by",
     "create_intended_at", "create_settled_at", "verified_at",
 )
+#: OS-14 I-4.  The five cells minted TOGETHER, before the external effect.  Spelled once
+#: so the writer, the validator and the reader cannot disagree about what a lease IS.
+#: `terminal_digest` is deliberately NOT here: it is bound one stage later, at `CREATED`.
+PAIR_LAUNCH_LEASE_KEYS = ("launch_token", "launch_stamp", "session_uuid",
+                          "endpoint_digest", "launch_argv_digest")
 #: Cleared when a NEW create attempt is published, so a retry's ``CREATE_INTENDED`` never
 #: carries the PREVIOUS ATTEMPT'S OWN result cells -- the digest of the session that
 #: attempt produced, that attempt's parsed refusal, that attempt's settle/verify stamps
@@ -905,10 +947,22 @@ PAIR_ENTRY_KEYS = (
 #: digest and keeps the superseded one's.  Clearing it would delete the only proof that
 #: the replaced session's use row is required -- i.e. it would restore, through the retry
 #: path, exactly the "a missing row means unused" reading this cell exists to refuse.
+#: OS-14 I-4.  The LAUNCH LEASE cells are cleared too, and that is the durable half of
+#: the mint rule: a retry or a supersession publishes a NEW `CREATE_INTENDED`, so the
+#: previous attempt's token, stamp, uuid, endpoint and argv digests -- and its
+#: `launch_revoked_at` -- are gone from the slot and the new attempt writes its own.  A
+#: recorded token therefore has exactly one create, and a new lease can never inherit the
+#: superseded lease's revocation stamp (which would make it born stale) or its endpoint
+#: (which would make two incarnations share a path).  Nothing about the SUPERSEDED session
+#: is lost by this: `supersedes_digest` / `supersedes_reason` are written in the SAME call
+#: that publishes the new attempt, the `sessions` use ledger is filed per terminal digest
+#: and is untouched, and `role_history` -- the drift baseline -- is untouched.
 _PAIR_ENTRY_ATTEMPT_CLEARED = {
     "terminal_digest": "", "refusal_command": "", "refusal_error_code": "",
     "refusal_receipt_digest": "", "create_settled_at": "", "verified_at": "",
     "supersedes_digest": "", "supersedes_reason": "",
+    "launch_token": "", "launch_stamp": "", "session_uuid": "",
+    "endpoint_digest": "", "launch_argv_digest": "", "launch_revoked_at": "",
 }
 
 # ---- OS-14 BUGFIX (review B1): the SESSION USE ledger --------------------------------
@@ -1117,6 +1171,29 @@ def validate_pair_entry(entry: Any) -> dict[str, Any]:
             raise PairPreparationCorrupt(
                 f"PAIR_PREPARATION_CORRUPT:session_use_digests {claimed!r} is not a "
                 "comma-joined set of non-empty digests")
+    # ---- OS-14 I-4: the LAUNCH LEASE is whole, or it is corruption -------------------
+    # The five mint cells are written in ONE `record()` call, so "some of them" cannot be
+    # produced by any interleaving of this module's writers.  A document that nevertheless
+    # holds a partial lease has been edited after the fact, and the one reading that must
+    # never be available for it is the permissive one: a lease with no token would read as
+    # "this session was never launched by us", and a token with no stamp would make the
+    # launch-precedes-verification ORDER unprovable.  Whole-or-nothing, the same
+    # discipline as every other cell above.
+    leased = [key for key in PAIR_LAUNCH_LEASE_KEYS if entry[key]]
+    if leased and len(leased) != len(PAIR_LAUNCH_LEASE_KEYS):
+        raise PairPreparationCorrupt(
+            "PAIR_PREPARATION_CORRUPT:launch lease is partial -- "
+            f"{sorted(leased)} present, "
+            f"{sorted(set(PAIR_LAUNCH_LEASE_KEYS) - set(leased))} missing")
+    if entry["launch_stamp"]:
+        if not entry["launch_stamp"].isdigit() or int(entry["launch_stamp"]) < 1:
+            raise PairPreparationCorrupt(
+                f"PAIR_PREPARATION_CORRUPT:launch_stamp {entry['launch_stamp']!r} is not "
+                "a decimal >= 1")
+    if entry["launch_revoked_at"] and not entry["launch_token"]:
+        raise PairPreparationCorrupt(
+            "PAIR_PREPARATION_CORRUPT:launch_revoked_at without a launch_token -- a "
+            "lease that was never minted cannot have been revoked")
     return dict(entry)
 
 
@@ -1596,6 +1673,67 @@ class FilePairPreparationStore:
             self._write(pairs, sections)
             return deepcopy(entry)
 
+    # ---- OS-14 I-4: the LAUNCH LEASE's two durable operations -----------------------
+    def launch_lease(self, phase: Any, gate_iteration: Any,
+                     role: str) -> dict[str, Any] | None:
+        """This slot's DURABLY RECORDED lease, or ``None`` when no lease was minted.
+
+        HISTORY, never AUTHORITY, and the distinction is the whole reason this reader is
+        safe to have: it answers "what launch did this run durably record for this slot",
+        never "is there a live binding".  A caller that finds a lease here and no live
+        channel in the driver's registry has found `DRIVER_TARGET_UNBOUND`, and a durable
+        record never restores a binding or a verification authority.
+
+        ``None`` is returned for an absent entry and for an entry with no `launch_token`.
+        Both are the same POSITIVE statement -- *this run recorded no launch for this
+        slot* -- because an absent or truncated DOCUMENT never reaches this method:
+        `_read_document` refuses it by name first.
+        """
+        entry = self.entry(phase, gate_iteration, role)
+        if entry is None or not entry["launch_token"]:
+            return None
+        return {key: entry[key] for key in
+                (*PAIR_LAUNCH_LEASE_KEYS, "launch_revoked_at", "terminal_digest",
+                 "requested_model", "run_id", "phase", "gate_iteration", "role",
+                 "create_attempt", "stage")}
+
+    def record_launch_revocation(self, phase: Any, gate_iteration: Any, role: str, *,
+                                 launch_token: str, revoked_at: str) -> dict[str, Any]:
+        """Stamp ``launch_revoked_at`` on the lease this slot currently holds.
+
+        Refuses when the slot holds a DIFFERENT token: a revocation that could land on a
+        lease it was not issued for would revoke the replacement a supersession had just
+        minted, which is the one write order the mint rule exists to keep straight.  An
+        absent entry, an unleased entry and a stale token are all refused rather than
+        written, and a second revocation of the SAME token is a no-op -- the FIRST
+        revocation stands, so the operation is idempotent for the caller that retries it.
+        """
+        if not launch_token:
+            raise PairPreparationCorrupt(
+                "PAIR_PREPARATION_CORRUPT:a revocation names no launch_token")
+        key = pair_key(phase, gate_iteration)
+        with self._section.locked():
+            sections = self._read_document()
+            pairs = sections["pairs"]
+            entry = (pairs.get(key) or {}).get(role)
+            if entry is None or not entry["launch_token"]:
+                raise PairPreparationCorrupt(
+                    f"PAIR_PREPARATION_CORRUPT:{key}/{role} holds no launch lease to "
+                    "revoke")
+            if entry["launch_token"] != launch_token:
+                raise PairPreparationCorrupt(
+                    f"PAIR_PREPARATION_CORRUPT:{key}/{role} holds launch_token "
+                    f"{entry['launch_token']!r} and the revocation names "
+                    f"{launch_token!r}; a revocation is never applied to another lease")
+            if entry["launch_revoked_at"]:
+                return deepcopy(entry)              # the FIRST revocation stands
+            updated = dict(entry)
+            updated["launch_revoked_at"] = revoked_at
+            updated["recorded_by"] = self.owner_id
+            updated = validate_pair_entry(updated)
+            pairs[key][role] = updated
+            self._write(pairs, sections)
+            return deepcopy(updated)
 
     # ---- OS-14 BUGFIX (review B1): the SESSION USE ledger ---------------------------
     def session_use(self, terminal_digest: str) -> dict[str, Any] | None:
