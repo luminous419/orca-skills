@@ -894,6 +894,16 @@ class DuplicateSettlementTests(unittest.TestCase):
         # an existing Run id to an existing run-owner terminal.
         "run_id": "run_offline",
         "run_owner": "term_owner",
+        # OS-14 I-1/I-7. The launch lease's public operations. The probe only needs
+        # BINDABLE values -- the sweep asks whether a method reverts a CLAIMED settlement
+        # row, not whether the lease contract accepts the argument -- so a token this
+        # harness never minted is exactly the right probe value: every lease operation
+        # must refuse it, and a refusal still must not revert the row.
+        "launch_token": "launch:probe:never-minted",
+        # `set_launch_lease_reader(reader)`: `None` is the production default and means
+        # "this harness cannot consult the durable record", which is the fail-closed
+        # state the launch leg reads as REQUEST ABSENT.
+        "reader": None,
     }
 
     def test_no_public_api_moves_a_claimed_row_back_to_absent(self) -> None:

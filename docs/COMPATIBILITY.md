@@ -1105,3 +1105,388 @@ against. A run launched under the v1 schemas is refused
 5. If step 2 cannot be completed — a listing that cannot be read, a `CREATE_INTENDED` entry
    with no observed outcome — stop and escalate. An unreadable source is unknown, never
    empty.
+
+## OS-14 TRACK B, first foundation PR — the launch lease, the v4 schema and the round-scoped target lifetime
+
+This section records what the **first foundation PR** of OS-14's real-driver work changed.
+It is deliberately narrow, and the narrowness is the point: three implementation units
+(**I-1** the launch lease, **I-4** its durable cells, **I-7** the post-create bind and the
+round-scoped lifetime) plus the one prerequisite **I-2** needs, and nothing else.
+
+**Nothing here is evidence about any real Claude or company model.** No real driver is
+registered, none is enabled by default, no `claude` process is launched by any code path in
+this release, and every test that exercises the new code drives it with a **stand-in** at
+the production boundary. A stand-in's success is wiring evidence; it is **not** a
+model-identity verification, and this document does not present it as one. The full
+specification remains `docs/OS-14-claude-driver-design.md`; the per-unit implementation
+status table lives at the top of that document.
+
+### The pair-preparation schema moves again: v3 → v4 (breaking for in-flight model-aware runs)
+
+| Document | Was | Now |
+| --- | --- | --- |
+| `.pair_preparation.json` | `os14.pair_preparation.v3` | `os14.pair_preparation.v4` |
+| `.pair_launch_binding.json` | `os14.pair_launch_binding.v2` | **unchanged** |
+
+The reading is **exactly** the fail-closed reading the v1 → v3 bump has, and it is
+*inherited* rather than re-implemented: `durable_store.read_json_document` refuses any
+document whose `schema_version` is not this exact string, raising
+`PairPreparationCorrupt`, which `OrcaAdapter` projects onto
+`PAIR_PREPARATION_RECORD_CORRUPT` (`INCOMPATIBLE_DURABLE_STORE`). An older, absent-versioned,
+corrupt or mismatching document is therefore refused **by name** and is **never** read as
+"nothing was prepared", "an unused session" or "no baseline yet". The behavioural half of
+that rule is locked by `test_a_v3_document_is_refused_under_the_v4_reader`, which asserts
+all four readings — `has_any`, `entry`, `session_use`, `role_history` — refuse on one
+complete, well-formed v3 document.
+
+**Nothing is converted, emptied or drained.** A v3 document stays byte-for-byte as it is on
+disk; the run that owns it is refused rather than reinterpreted; and no past in-flight run's
+sessions, Tasks or dispatches are cleaned up by this change. The transition procedure is the
+one already documented above for a pre-v3 run — *inspect before you relaunch* — and it is
+unchanged.
+
+**Why a bump is required rather than additive tolerance.** A v3 entry records no statement
+about whether the session it names was launched by this engine under a lease. Read under the
+v4 rules it would answer "no lease" for a fact it never recorded, which makes a lease-less
+session indistinguishable from a session nobody launched — the same class of silent-empty
+reading the two earlier bumps exist to refuse.
+
+### The new entry cells: the launch lease
+
+Six cells are added to the `pairs` entry. Five are minted **together**, in the
+`CREATE_INTENDED` write that already runs strictly **before** the one external effect of
+preparation; the sixth is the revocation stamp.
+
+| Cell | Written at | What it is |
+| --- | --- | --- |
+| `launch_token` | `CREATE_INTENDED` | the harness-minted capability every later driver call on this session must cite |
+| `launch_stamp` | `CREATE_INTENDED` | decimal string; the ordinal of the mint, drawn from the **same** private monotone counter the verification tickets draw from, so "the launch preceded the verification that cites it" is integer order over harness-issued values |
+| `session_uuid` | `CREATE_INTENDED` | the CLI `--session-id` the launch argv would be composed with |
+| `endpoint_digest` | `CREATE_INTENDED` | `sha256` of the derived control-endpoint path — **never** the path |
+| `launch_argv_digest` | `CREATE_INTENDED` | `sha256` of the launch **request** (command, requested model, session uuid, endpoint digest). See the honesty note below |
+| `launch_revoked_at` | at revocation | set once; a revoked lease is stale |
+| `terminal_digest` | `CREATED` | **pre-existing cell.** Bound only after the create receipt is observed, because the handle does not exist before `terminal create` returns |
+
+**Whole or corruption.** The five mint cells are written in one `record()` call, so a
+partial lease cannot be produced by any interleaving of the store's writers.
+`validate_pair_entry` therefore refuses a partial lease, a non-decimal or zero
+`launch_stamp`, and a `launch_revoked_at` with no `launch_token` — a lease that was never
+minted cannot have been revoked.
+
+**The mint rule, and its durable half.** **ONE lease per `terminal create`, never
+re-exercised by a second create.** The three reachable creates — a first create, a retry
+after a parsed `CREATE_REFUSED`, and a reuse-gate supersession — each mint a **new** token,
+and the superseded token is revoked by the mint that replaces it. Durably,
+`_PAIR_ENTRY_ATTEMPT_CLEARED` clears every lease cell when a new create attempt is
+published, so a replacement can neither inherit the superseded lease's revocation stamp (and
+be born stale) nor its endpoint (and share a path with another incarnation). Nothing about
+the **superseded session** is lost by that: `supersedes_digest` / `supersedes_reason` are
+written in the same call, the `sessions` use ledger is keyed per terminal digest and is
+untouched, and `role_history` — the drift baseline — is untouched.
+
+**`launch_argv_digest`, stated honestly.** The launch-command seam (**I-3**) and the driver
+that composes a provider argv (**I-6**) are **not** in this release, so there is no literal
+argv to digest yet, and this cell does not pretend otherwise: it digests the four inputs an
+argv is composed from. I-3/I-6 replace it with the digest of the argv they actually compose.
+No provider flag, syntax or stream grammar is invented anywhere in this release.
+
+### The barrier gains one leg: the LAUNCH, attested
+
+`ModelEvidence` gains two attested fields, `launch_token: str = ""` and
+`launch_stamp: int = 0` — additive with `""`/`0` defaults, exactly as `ReuseObservation` and
+`RuntimeAttempt` do it, so every existing construction binds unchanged. `ModelSelectionTicket`
+carries the same two read-only values so a conforming driver knows **which** launch it is
+being asked to re-validate.
+
+**Whether the leg runs is decided by PROVENANCE, not by the presence of evidence (PR40-B1).**
+The first edition entered the leg only when this process's registry held a lease for the
+session **or** the driver cited a token — which answered *must this launch be verified* with
+*is there any launch evidence to hand*. A successor process has an empty registry, so the
+ticket offers `launch_token: ""` / `launch_stamp: 0` and a **conforming** driver that cites
+what the ticket tells it about returns that empty citation; the leg was then skipped before
+the durable lease was read at all, and a session this run had demonstrably launched under a
+lease was verified by a process holding no lease and no binding for it. The obligation is now
+read off **this run's own durable record**, attributed to the target by run, phase, gate
+iteration, role and terminal digest — never off the registry, the citation or the current
+capability. An empty citation, an empty registry and an absent live target are **not**
+grounds for a legacy verdict. The durable provenance has **four** answers, not two, and the
+distinction is load-bearing: `recorded` (a lease is on file for this target), `no_launch_recorded`
+(the document positively states this run recorded none — the one answer that may read as
+genuinely **legacy**), and `unreadable` / `no_reader` (the question could not be answered).
+A reader failure, an absent reader and a corrupt record are **never** a verified no-lease
+state. The genuine legacy and reference-driver paths are unchanged: nothing records a lease
+for them, so nothing obliges them.
+
+The leg **(a2)** performs **six** checks — the obligation, then the five the first edition
+had — every one of them an equality or an integer order over a value this harness issued or
+this run itself durably wrote. No provider knowledge, no stream parsing, no trust in the
+driver anywhere in the leg:
+
+| Check | What it compares | Reported as |
+| --- | --- | --- |
+| **(a2-0) obligation** (PR40-B1) | the **durable** record names a launch for **this** target and this process holds no lease for it | `model_selection_request_absent`; a record already stamped revoked is `model_selection_request_stale`; an **unreadable** record is `model_selection_unverified` |
+| **(a2-1) citation** | a launch is cited **iff** one was minted for this session, and the cited token is one this harness minted | `model_selection_request_absent` |
+| **(a2-2) durability** | the citation is confirmed by the **durable** record; a lease that exists only in this process's memory is never sufficient | `model_selection_request_absent` |
+| **(a2-3) liveness** | neither the registry nor the record shows it revoked, and the session was not already released | `model_selection_request_stale` |
+| **(a2-4) target** | the lease's `(run, phase, role, gate iteration)` key is this attempt's, it **has** a target, and that target is **this** session | `model_selection_request_stale`; an **unbound** lease is `model_selection_unverified` carrying `DRIVER_TARGET_UNBOUND` |
+| **(a2-5) order** | `0 < launch_stamp == the minted stamp < request_stamp` | `model_selection_request_stale` |
+
+plus one equality on the **model** — a lease that records a different requested model than
+the routing declares is `model_selection_mismatch`, not a staleness.
+
+**Every one of those is an EXISTING member of the closed failure vocabulary.** This release
+adds **no** vocabulary member. The three members the design's P-7/I-10 would add —
+`cli_launch_model_flag`, `cli_launch_lease_revalidation` and
+`stream_json_preflight_assistant` — are deliberately **absent**, because adding a request
+method early makes an unauthorised path look eligible. The consequence is checkable and is
+asserted: a driver attesting `cli_launch_model_flag` today is refused
+`model_selection_unsupported`, because the member does not exist. Adding it is the visible,
+reviewed act that lifts that refusal, and it has not happened.
+
+**D2's revalidation semantics, in the form this release can hold them.** The first launch of
+a session is the act that selects a model; every later driver call on that session
+**re-validates** that launch and performs no new one. Structurally enforced: a lease is
+minted only on the preparation path, strictly once per create, and both the pre-pass and
+Gate B of one attempt cite the **same** `launch_token`. The *member name* that would make
+that attestation self-describing is I-10's and is deferred; the enforcement is not.
+
+**A durable record restores nothing.** The lease registry and the target binding are
+in-process state, deliberately: the design's restart rule is a **named refusal**, so there
+is nothing durable to resurrect. A successor process starts with an empty registry, finds a
+durable lease it did not mint, and refuses — it never rebinds. **And it refuses whatever the
+driver cites, including nothing at all** (PR40-B1): the refusal is grounded in the durable
+record of the launch, so an empty citation cannot route around it. The refusal is also only
+a refusal — a successor mints no lease, binds nothing, relaunches nothing, attempts no
+recovery, and leaves the durable record exactly as it found it. A durable lease with no live
+channel is `DRIVER_TARGET_UNBOUND`; a second process under a recorded handle is
+`DRIVER_TARGET_REBOUND`; an unmatched bind echo is `DRIVER_BIND_UNCONFIRMED`. All three are
+driver-local target states reported through existing vocabulary members, and none of them is
+ever repaired by rebinding.
+
+### The target lifetime is now ROUND-scoped, not settlement-scoped (TL)
+
+A prepared target's channel and lease are held from its `CREATED` write until the **gate
+ROUND** that prepared it **closes**. The round is one `(phase, gate iteration)` key together
+with **every** graph turn the engine runs under it — the Worker's turn, the phase-Reviewer's
+turn, and every validation-repair turn of either role. `release(handle)` is called for every
+handle prepared under that key, **exactly once**, at round close, and it is **idempotent**.
+
+A round closes on the first of:
+
+1. **validated completion** — **(1a)** every role **required by the round** has reached
+   `VALIDATED` **and (1b)** the token ROUTE emitted is neither `PREPARE_REPAIR` nor
+   `PREPARE_PHASE_REVIEWER`. The required-role set is the engine's own rule, read from
+   `routing.phase_gate`: at `risk == "low"` the **Worker alone**; otherwise the **Worker and
+   the phase Reviewer**, whether or not the Reviewer has been dispatched yet. An undeclared
+   risk takes the stricter set.
+2. **refusal or abandonment** — any preparation refusal on this key, a Gate B refusal, a
+   delivery failure, a `CANCEL`/`ABANDON`, or a `PAUSE`.
+
+**Why not "after settlement".** `settle_attempt` runs inside `EXECUTE_INTENT`; a malformed
+decision-gate record is classified one node **later**, in `VALIDATE_SETTLEMENT`; and ROUTE
+may then re-dispatch the **same role in the same round**. `_prepare_pair` verifies **both**
+roles unconditionally on **every** pass, so the Reviewer's turn — and every repair turn —
+re-verifies the **settled** Worker's own session. A settlement-scoped release tears down
+exactly the target the next turn is about to re-verify, and the design measured the
+consequence: `PAIR_PREPARATION_MODEL_UNOBSERVED`.
+
+**What TL does NOT change.** Dispatch settlement, current model authority and Orca's
+dispatch capability are all untouched — Orca revokes the dispatch capability at settlement
+and TL has no claim on it. Nothing is carried **across** rounds: a new `(phase, attempt)`
+key is a fresh session and a fresh lease. TL does not decide whether a repair **reuses** the
+held session: the shipped reuse gate does, through its one production consumer, and TL only
+removes a reason the gate could never have been asked. And TL assumes **no** cleanup on
+Coordinator process exit — the in-process registry dies with the process, and the surviving
+CLI child is the **operator's residual**, under the residual-session procedure already
+documented above.
+
+**`release(handle)` is channel and lease cleanup, and nothing more.** It revokes the lease,
+drops the binding, asks the driver to close its own channel when it can, unlinks the derived
+endpoint path and removes the per-run directory when empty — tolerating `ENOENT`, because
+both sides unlink and the authoritative "this endpoint is finished" fact is the **revoked
+lease**, not the file. It does **not** terminate a CLI child and does **not** close an Orca
+terminal. A released session is also refused rather than silently read as legacy: a later
+verification of a released handle is `model_selection_request_stale`.
+
+**Clause 2 is connected to every FAILABLE part of a dispatch, not only to the refusal exit
+(PR40-B2).** The first edition registered a handle as its round's disposal target only
+**after** the post-create bind, and routed clause-2 disposal only through
+`_refuse_preparation` and the engine's post-settlement observer. Four failures therefore
+left a round's sessions, leases and bindings standing with nothing able to tear them down:
+a bind the driver did not confirm (`DRIVER_BIND_UNCONFIRMED`), a preparation **pre-pass**
+refusal, a **real Gate B** refusal (which happens one frame below, inside
+`run_existing_task`), and a delivery failure after the Task already existed. Two things
+changed and nothing else:
+
+- **the handle is registered as its round's disposal target the moment its create receipt
+  is in hand** — strictly before `bind_launch_lease` and `bind_prepared_target`, both of
+  which can fail. Registration is the statement *this round created this session and
+  therefore owes its teardown*; it is **not** a binding success and **not** a
+  model-verification success, nothing downstream reads it as permission, and only a handle
+  a receipt reported can reach it — no session is ever invented or adopted by title; and
+- **`OrcaAdapter.start` is the one frame that sees all four failures**, so clause 2 is
+  connected there. It is scoped to the round this call established (the key is compared
+  against the intent's own `(contract_phase, gate_iteration)`), so a failure raised before
+  the call entered a round cannot dispose of a previous one.
+
+**Cleanup never replaces the failure it is cleaning up after.** The original exception is
+re-raised unchanged, so every named refusal, the `IdempotencyRecoveryError` → BLOCKED
+projection and the exception-normalisation contracts stand exactly as they are, and no
+cleanup can turn a failure into a success. `BaseException` is **not** caught anywhere on
+this path, so `KeyboardInterrupt` / `SystemExit` / `GeneratorExit` propagate as themselves
+and **a hard process exit or `SIGKILL` still promises no cleanup at all** — that exclusion
+is unchanged. An additional error **during** cleanup is recorded as its own diagnostic
+(`RoundTargetLifetime.release_errors`, and a `dispose:clause2:error` row in
+`round_lifecycle_log`) and may not cancel the remaining handles' cleanup attempts: the
+disposal loop records a failed teardown and continues to the next handle.
+
+**With a healthy store the two halves of a release agree; with an unhealthy one, nothing
+claims they did.** `release(handle)` revokes the live lease and drops the binding, and the
+adapter's own half stamps `launch_revoked_at` on the durable record. The live half runs
+first, so an injected durable-write failure leaves the in-memory invalidation done, the
+remaining handles still cleaned up and the failure diagnosed — and the durable cleanup is
+reported as **not** having succeeded rather than assumed. A pre-delivery refusal (bind,
+pre-pass, Gate B) performs **zero** deliveries; a delivery failure after the Task and the
+delivery attempt exist preserves the obligation/UNKNOWN record the shipped path already
+writes, settles nothing successfully, re-delivers nothing and delivers to no other target.
+The authority/history separation and the shipped reuse gate are untouched.
+
+### How the engine reports a round's lifetime (I-7's engine connection)
+
+TL needs four facts about a round, and every one of them is a decision the deterministic
+engine already owns. So the engine **reports** them and the adapter decides what they mean
+for a target's lifetime. There is exactly **one** port —
+`OrcaAdapter.observe_round_lifecycle(event, …)` — with a **closed** four-member event
+vocabulary, and the engine calls it from five places:
+
+| Node | Event | What it states |
+| --- | --- | --- |
+| `execute_intent_node`, once the settlement event is in hand | `settled` | this role's Dispatch settled and nothing has classified it yet ⇒ `SETTLED_PENDING_VALIDATION` |
+| `validate_settlement_node`, on its no-defect returns | `validated` | the result's FORM was accepted ⇒ `VALIDATED`. A **defective** settlement is deliberately not reported: whether it becomes `REPAIR_PENDING` is ROUTE's decision one node later |
+| `route_node`, after it computes the token | `route` | the token verbatim, plus the run's own `risk` and the role `repair_binding` names |
+| `pause_node` | `dispose` | TL clause 2, the pausing path |
+| `dispose_node` | `dispose` | TL clause 2, the disposing path (`CANCEL` / `ABANDON`), before TERMINAL |
+
+**The hook observes; the graph decides.** `graph_spec.GRAPH_OWNED_DECISIONS` keeps owning
+`PHASE_GATE`, `CORRECTION_LOOP` and `VALIDATION_REPAIR`. Four properties make that
+checkable rather than asserted, and each has a test: every node computes its own answer
+**before** reporting and **discards** the observer's return value; the observer wrapper is
+total for ordinary exceptions, so a channel teardown that fails cannot change where the
+workflow goes next (`BaseException` still propagates); the port is resolved **once**, at
+`build_graph`, so no node can acquire a different observer mid-run; and an adapter with no
+port — a legacy run, a `None` driver, the fake adapter — yields `None` and every call site
+is inert. The comparison test runs one scenario three ways (wired, port removed, port
+raising) and requires the terminal status, the repair budget and the whole node/token
+sequence to be identical.
+
+**The round key is recorded, not re-derived.** `OrcaAdapter.start` records
+`(contract_phase, gate_iteration)` from the intent before any effect — the same key
+`_prepare_pair` registers handles under. That is load-bearing: `apply_result_node` advances
+`phase_iterations` for the gate round that just settled, so `gate_iteration` evaluated at
+ROUTE would name the **next** round, and the round that is closing is the one that just ran.
+
+**Which clause applies is decided in one place, and the predicate is always asked first.**
+On every token the close predicate is consulted; if it closes, that is **clause 1**. If it
+does not and the token is one of the two that keep a round open (`PREPARE_REPAIR`,
+`PREPARE_PHASE_REVIEWER`), the round is **held**. Otherwise the engine has left the key
+while a required role never reached `VALIDATED` — a gate block, an escalation, a pause, a
+cancel, an abandon, or a phase/correction transition — and that is **clause 2**. Asking the
+predicate first matters: an earlier edition answered `PREPARE_PHASE_REVIEWER` with a hold of
+its own, which re-implemented (1b) outside the predicate and masked a hook whose (1a)
+quantified over *dispatched* roles. The three wrong-hook negative controls are what catch
+that, and they only can if the predicate decides.
+
+**A FINAL REVIEW round's required role is the Final Reviewer**, at every risk level:
+`routing.final_gate` reads no worker or phase-reviewer result at all, so quantifying such a
+round over `worker`/`reviewer` would make its close unsatisfiable and report every completed
+run's last round as a disposal. Nothing is ever prepared for it (the Final Reviewer is
+outside the pair rule), so the release set is empty either way; what the distinction fixes
+is the **clause**.
+
+**At LOW risk no pair is prepared at all.** `pair_admission_required` is false because the
+Reviewer routing entry is optional there, so `_prepare_pair` never runs and the round has no
+handle to release. That is TL's own "no release is required for a handle that was never
+created" — the round still closes under **clause 1**, over the Worker alone, with an empty
+release set.
+
+Every observation is appended to `OrcaAdapter.round_lifecycle_log`, a **diagnostic**:
+nothing reads it to decide anything. It exists because a correct hold and a connection that
+never fired both produce zero releases, and the log is what distinguishes them.
+
+### One locked contract was adjusted, by the mechanism it already provides
+
+OS-37 **DESIGN D4.1** byte-freezes four engine policy modules to `BASELINE_REV = d13b7fa`
+(`scripts/test_os37_driver_isolation.py`): `graph.py`, `routing.py`, `executor.py`,
+`state.py`. I-7's engine connection cannot be written without editing two of them — the
+facts TL needs exist only in `executor.py`'s nodes, and the one place an observer can be
+bound to the pure `ROUTE` node is `graph.build_graph`.
+
+The lock was extended by **the same mechanism `contracts.py` already uses**, not re-pinned:
+
+* the edit is declared by **line range** —
+  `POLICY_MODULE_ADDITIVE_RANGES` = `graph.py` `(15, 16), (412, 417), (420, 421), (426, 428), (431, 432), (437, 438), (441, 442)`,
+  `executor.py` `(68, 104), (106, 114), (116, 127), (372, 372), (391, 391), (401, 408), (509, 509), (517, 518), (522, 529), (592, 593), (601, 602), (606, 611), (693, 707), (718, 720), (738, 743), (757, 761)`;
+* what is pinned is each module's **policy region** — every byte outside those ranges;
+* `POLICY_MODULE_SUPERSEDED_RANGES` names the baseline lines the edit replaced — **seven**
+  in `graph.py` and **five** in `executor.py`, all of them the import block, the five node
+  registrations and the five node signatures;
+* and `test_the_policy_pins_are_the_baseline_and_not_this_tickets_output` **proves** the
+  region digests are the ones `d13b7fa` holds outside the superseded ranges, computed from
+  the git object. `BASELINE_REV` is unchanged, so the authority is still the baseline and
+  not this change's own output — a pin regenerated from a modified file fails there.
+
+`routing.py` and `state.py` are **untouched and still pinned byte-for-byte**: the
+connection adds no route target, no node and no branch on any routing, decision or review
+policy. The independent second reading,
+`test_policy_modules_carry_no_standalone_branch`, is unchanged. A change **outside** the
+declared ranges still fails the gate, which is verified rather than assumed.
+
+### The control endpoint: derived, never discovered
+
+`<state_dir>/os14/<run_id>/<sha256(launch_token)[:16]>.sock`, where `state_dir` is
+`$XDG_RUNTIME_DIR` when set and the platform temporary directory otherwise — **never**
+inside the repository or a worktree. Only the **digest** reaches a durable cell, an artifact
+or a log. The composed path's length is asserted against the **platform's own** `sun_path`
+budget rather than against a constant from the design, because that budget is 104 bytes on
+the macOS build this work was measured on and 108 on Linux. The probe is a `connect()`, which
+CPython rejects for an over-long address **before any syscall**, so the assertion creates
+nothing, unlinks nothing and disturbs no listener. An over-long path is
+`LAUNCH_ENDPOINT_PATH_TOO_LONG`, refused before any effect, and the diagnostic reports the
+**length** only.
+
+**No socket is bound by this release, and no directory is created.** The supervisor shim that
+would bind the endpoint is **I-5** and is not here, so the harness **derives** the path,
+records its digest and creates nothing on the filesystem — a mint performs no filesystem
+effect at all. Creating `<state_dir>/os14/<run_id>/` at `0700`, which the design places
+before `terminal create`, moves with I-5. `release(handle)` already unlinks the path and
+removes the per-run directory when empty, and tolerates both being absent, so the two halves
+do not have to land together.
+
+### What stays UNSUPPORTED by default, and what is still not implemented
+
+- **No real driver is registered or enabled.** `model_driver` still defaults to `None`, and
+  `None` still yields the **empty** capability set, so the real runtime stays fail-closed by
+  construction rather than by remembering to pass nothing. A declared model with no driver is
+  still refused at the declaration gate with `AGENT_MODEL_NOT_SUPPORTED`, and again at the
+  pre-delivery barrier with `model_selection_unsupported`.
+- **The hosted-delivery capability (the rule HC) is one derivation over two names.** It exists
+  **iff** `deliver_hosted` **and** `bind_target` are **both** callable on the driver object.
+  One name is not hosted-capable, either way round. When HC does **not** hold, the
+  preparation gate mints **no** lease at all, writes **no** lease cell and derives **no**
+  endpoint: the sessions it prepares are **genuinely legacy** and take today's delivery path
+  because they carry nothing hosted to recognise — not because a capability was re-read later
+  and found wanting. HC is **never** a recognition input.
+- **The legacy and reference-driver paths are byte-unchanged.** The default path, the `None`
+  driver and OS-49's `InProcessModelDriver` mint nothing, record nothing and create no
+  directory.
+- **Not implemented in this release, and named rather than implied:** **I-3** the
+  launch-command seam and the contract-lock replacement it forces; **I-5** the `AF_UNIX`
+  supervisor shim; **I-6** the Claude driver module and its stream parser; **I-8** the hosted
+  delivery branch and its three-way `delivered` / `not_delivered` / `UNKNOWN` verdict;
+  **I-9** permission scope (a **proposal only** — see
+  `docs/OS-14-permission-scope-proposal.md`); and **I-10** the three vocabulary members.
+  I-7's engine connection is **implemented** — see the next subsection.
+- **Still 미검증, and no test in this release changes it:** everything that requires a real
+  model turn. No model identity has been verified against any provider by this code, the
+  hold's **wall-clock** cost remains unmeasured (D5), and the company (PortKey/GLM)
+  environment is untouched.

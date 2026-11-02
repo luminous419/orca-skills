@@ -3416,6 +3416,15 @@ class AttestedFieldTypeGateTests(ModelSessionTestCase):
         ("observed_at_role", str),
         ("observed_at_phase", str),
         ("observed_at_attempt", int),
+        # OS-14 I-1.  The LAUNCH leg's two attested fields.  This table's own docstring
+        # anticipated "a future sixteenth field"; the launch lease adds two, and they
+        # inherit every protection the fifteen already have -- the single snapshot, the
+        # hoisted type gate, the read-once count and the per-field refusal coverage --
+        # rather than being exempted from them.  The barrier's leg (a2) compares a token
+        # for equality and orders two ordinals, which are exactly the operations a
+        # hostile `__eq__` / `__lt__` would own, so an exempt field would be the hole.
+        ("launch_token", str),
+        ("launch_stamp", int),
     )
 
     #: The refusal member a failed type gate carries, where it is not the default. Both
@@ -3508,7 +3517,12 @@ class AttestedFieldTypeGateTests(ModelSessionTestCase):
         declared = tuple(
             (field.name, field.type) for field in dataclasses.fields(ModelEvidence)
         )
-        self.assertEqual(len(declared), 15, "ModelEvidence no longer has 15 fields")
+        # 15 at OS-49; 17 since OS-14 I-1 added the attested LAUNCH leg (`launch_token`,
+        # `launch_stamp`).  The number moves WITH an approved contract change and the
+        # table above moves with it in the same commit -- which is this guard working, not
+        # this guard being relaxed: a field added without extending the table still fails.
+        self.assertEqual(len(declared), 17,
+                         "ModelEvidence no longer has 17 fields")
         self.assertEqual(
             tuple(name for name, _ in declared),
             tuple(name for name, _ in self.ATTESTED_FIELD_TYPES),

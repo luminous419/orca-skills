@@ -52,6 +52,41 @@ PAIR_PREPARATION_REFUSAL_CODES = frozenset({        # CLOSED.  The complete set.
 })
 
 
+# ---- OS-14 I-7: the ROUND LIFECYCLE events the deterministic engine reports ----------
+#: CLOSED.  The complete set, and deliberately four facts rather than four commands: the
+#: engine states WHAT HAPPENED and this adapter decides what that means for a target's
+#: lifetime.  Routing, repair and budget decisions stay the graph's
+#: (``graph_spec.GRAPH_OWNED_DECISIONS``); nothing in this module computes a token, reads
+#: ``phase_gate``, or touches ``remaining_repair_budget``.
+#:
+#:   ``settled``        -- ``settle_attempt`` has run for this role's Dispatch inside
+#:                         EXECUTE_INTENT, and VALIDATE_SETTLEMENT has not classified it
+#:   ``validated``      -- VALIDATE_SETTLEMENT produced NO gate defect for it
+#:   ``route``          -- the token ROUTE emitted, verbatim, plus the run's own ``risk``
+#:                         and (on a repair) the role ``repair_binding`` names
+#:   ``dispose``        -- the PAUSE / DISPOSE node ran: TL clause 2, by name
+ROUND_LIFECYCLE_EVENTS = ("settled", "validated", "route", "dispose")
+
+#: The two ROUTE tokens that keep a round OPEN, resolved lazily from the runtime that owns
+#: the definition so this module keeps no second copy of it.  `()` when the runtime is
+#: absent, which makes the clause-2 fallback the conservative answer rather than a crash.
+def _round_open_tokens() -> tuple:
+    try:  # repository layout
+        from scripts.orca_runtime_harness import ROUND_OPEN_ROUTE_TOKENS as tokens
+    except ImportError:  # pragma: no cover - flat installed layout
+        try:
+            from orca_runtime_harness import ROUND_OPEN_ROUTE_TOKENS as tokens  # type: ignore[no-redef]
+        except ImportError:
+            return ()
+    return tuple(tokens)
+
+#: The engine's role spelling -> the preparation document's.  The SAME mapping
+#: ``OrcaAdapter._role`` applies to an intent, reachable without one because the ROUTE
+#: observation has no intent in hand (``apply_result_node`` cleared it one node earlier).
+_LIFECYCLE_ROLES = {"WORKER": "worker", "PHASE_REVIEWER": "reviewer",
+                    "FINAL_REVIEWER": "final_reviewer"}
+
+
 def _observed_detail(observed: dict[str, str]) -> str:
     """``{"1": "<model-a>"}`` -> ``"gate iteration 1 -> '<model-a>'"``.
 
@@ -114,6 +149,26 @@ def _default_result_parser(attempt: Any, intent: ActionIntent) -> dict[str, Any]
     return decision_contract.parse_agent_settlement(attempt, intent)
 
 
+def _safe_error_text(exc: BaseException) -> str:
+    """``f"{type(exc).__name__}: {exc}"`` -- but a diagnostic may never replace the failure
+    it is diagnosing.
+
+    The same rule ``orca_runtime_harness.safe_exception_text`` states, spelled here rather
+    than imported because this package takes no runtime import.  The caught object on the
+    one path that uses this reaches the model DRIVER's own ``release_target``, so it is not
+    necessarily this repository's and its ``__str__`` is free to raise.  Ordinary
+    ``Exception`` from the render is handled; control-flow exceptions propagate as
+    themselves, exactly as the runtime's helper does.
+    """
+    try:
+        return f"{type(exc).__name__}: {exc}"
+    except Exception:                   # noqa: BLE001 - the render itself failed
+        try:
+            return f"{type(exc).__name__}: <unrenderable>"
+        except Exception:               # noqa: BLE001 - even the type name failed
+            return "<unrenderable error>"
+
+
 class OrcaAdapter:
     """Synchronous façade over ``create_task`` and ``run_existing_task``."""
 
@@ -143,6 +198,291 @@ class OrcaAdapter:
         self.pair_preparation = pair_preparation
         self._receipts: dict[str, dict[str, Any]] = {}
         self._events: dict[str, SettlementEvent] = {}
+        # ---- OS-14 I-7: the ROUND-SCOPED target lifetime (design 3a.12.1, TL) --------
+        # Resolved lazily off the harness, so an adapter built on a harness that predates
+        # the lease simply has no lifetime object and every path below is a no-op.  The
+        # tracker is IN-PROCESS state on purpose: TL's restart rule is a NAMED REFUSAL, so
+        # there is deliberately nothing durable here for a successor to resurrect, and a
+        # Coordinator process exit assumes NO cleanup at all.
+        self._round_lifetime: Any = None
+        # The `(phase, gate_iteration)` key preparation is currently working under, so a
+        # refusal raised anywhere in step 4 knows which round's handles to release -- and
+        # so a refusal raised BEFORE any create finds nothing to release, which is correct
+        # rather than a gap.
+        self._preparing_key: tuple[Any, Any] | None = None
+        #: Every round-lifecycle observation this adapter made, in order.  A DIAGNOSTIC
+        #: and never an authority -- see `_log_round_lifecycle`.
+        self.round_lifecycle_log: list[dict[str, Any]] = []
+        if self.pair_preparation is not None:
+            reader = getattr(self.harness, "set_launch_lease_reader", None)
+            if callable(reader):
+                # The harness owns the barrier's launch leg and this adapter owns the
+                # preparation document, and the barrier must be able to refuse a lease
+                # that exists only in process memory.  So the DURABLE read is handed in
+                # rather than imported: this package must stay importable with no runtime,
+                # and the runtime must stay importable with no engine package.
+                reader(self._read_durable_launch_lease)
+
+    # ---- OS-14 I-7: the round-scoped target lifetime --------------------------------
+    def _read_durable_launch_lease(self, *, role: str, phase: Any,
+                                   attempt: Any) -> dict[str, Any] | None:
+        """The barrier's DURABLE lease read.  Unreadable is never permission.
+
+        `None` means ONE thing and one thing only: the document POSITIVELY states this run
+        recorded no launch for this slot (`PairPreparationStore.launch_lease` answers
+        `None` for an absent entry and for an entry with no `launch_token`, and both are
+        that statement -- an absent or truncated document never reaches it, because
+        `_read_document` refuses it by name first).
+
+        **PR40-B1.**  A store error is therefore RAISED rather than mapped onto `None`.
+        It used to be mapped, which made "the record cannot be read" indistinguishable
+        from "there is no record", and the barrier's obligation check cannot afford that
+        conflation: an unreadable record is not evidence that a session was never
+        launched.  The harness's own `_launch_provenance` catches it and names it
+        `unreadable`, and the leg that only needs a yes/no (`_durable_launch_lease`) still
+        reads it as "not confirmed", which is the fail-closed answer it always gave.
+        """
+        store = self.pair_preparation
+        if store is None:
+            return None
+        return store.launch_lease(phase, attempt, role)
+
+    def round_lifetime(self) -> Any:
+        """The ONE TL tracker for this adapter, or `None` on a harness without one.
+
+        `risk` is read off the harness, which is where the run's risk already lives, so
+        the required-role set this object quantifies over and `routing.phase_gate`'s own
+        rule cannot disagree about what a round needs.
+        """
+        if self._round_lifetime is None:
+            factory = getattr(self.harness, "round_target_lifetime", None)
+            if callable(factory):
+                self._round_lifetime = factory(
+                    risk=str(getattr(self.harness, "risk", "") or ""),
+                    release=self._release_target)
+        return self._round_lifetime
+
+    def _release_target(self, handle: str) -> None:
+        """TL's one release, with BOTH halves: the live one and the durable one.
+
+        `harness.release(handle)` revokes the in-process lease, drops the binding and
+        tears the channel down.  The durable `launch_revoked_at` stamp is the half a
+        SUCCESSOR process reads: without it a successor would find a durable lease with no
+        revocation and no live channel, which is `DRIVER_TARGET_UNBOUND` either way -- but
+        a stamped record says WHY, and the barrier's launch leg refuses a stamped lease as
+        stale rather than as merely unbound.
+
+        Idempotent in both halves, and neither half can replace the other's failure: a
+        durable write that refuses does not un-revoke the live lease, and a release is
+        never reported as a success because a stamp happened to land.
+        """
+        lease = None
+        reader = getattr(self.harness, "launch_lease_for_handle", None)
+        if callable(reader):
+            lease = reader(handle)
+        releaser = getattr(self.harness, "release", None)
+        if callable(releaser):
+            releaser(handle)
+        store = self.pair_preparation
+        if lease is None or store is None:
+            return
+        try:
+            store.record_launch_revocation(
+                lease.phase, lease.attempt, lease.role,
+                launch_token=lease.launch_token, revoked_at=_now())
+        except pause_store.PauseStoreError:
+            # The slot no longer holds this token -- a supersession already replaced it,
+            # and the replacement must NOT be stamped with the superseded lease's
+            # revocation.  `record_launch_revocation` refuses exactly that, and a refused
+            # stamp is the correct outcome here rather than an error to propagate: the
+            # live lease is already revoked, which is the authoritative fact.
+            pass
+
+    def observe_round_route(self, token: str, *, phase: Any, attempt: Any) -> tuple:
+        """TL clause 1 for one key.  OBSERVE the token ROUTE emitted; release iff it closes.
+
+        This adapter owns NO routing and no repair decision: `VALIDATION_REPAIR`,
+        `PHASE_GATE` and `CORRECTION_LOOP` are in `graph_spec.GRAPH_OWNED_DECISIONS` and
+        stay there.  The engine decides; this method only converts the decision into the
+        target-lifetime consequence.
+
+        Called by `observe_round_lifecycle("route", ...)`, which is the port
+        `executor.route_node` reports every emitted token through.
+        """
+        lifetime = self.round_lifetime()
+        return () if lifetime is None else lifetime.observe_route(
+            token, phase=phase, attempt=attempt)
+
+    # ---- OS-14 I-7: the ONE port the deterministic engine reports through ------------
+    def observe_round_lifecycle(self, event: str, *, intent: Any = None, token: str = "",
+                                risk: str = "", repair_role: str = "",
+                                reason: str = "") -> tuple:
+        """Report ONE round-lifecycle fact from the engine.  Returns the handles released.
+
+        **This is an OBSERVER and it is the whole of the engine connection.** It computes
+        no routing token, consults no gate, spends no repair attempt and resets no budget:
+        every fact it needs is handed to it by the node that already owns that decision.
+        The engine calls it, ignores the return value, and is unaffected by it -- the four
+        call sites are `execute_intent_node` (after the settlement event is in hand),
+        `validate_settlement_node` (on its no-defect returns), `route_node` (with the token
+        it just computed) and the PAUSE / DISPOSE nodes (TL clause 2).
+
+        **The round key is the one THIS adapter last dispatched under**, not a value
+        re-derived from the state at observation time, and that is load-bearing:
+        `apply_result_node` advances `phase_iterations` for the gate round that just
+        settled, so `artifact_identity.gate_iteration` evaluated at ROUTE would name the
+        NEXT round. `start()` records `(contract_phase, gate_iteration)` from the intent
+        before any effect, which is exactly the key `_prepare_pair` registers handles
+        under, so the two can never disagree.
+
+        **A no-op whenever there is nothing to observe**: no lifetime tracker (a harness
+        that predates the lease), no round key yet (nothing dispatched), or an unknown
+        event. A legacy / `None`-driver run reaches the first two, so the engine's call is
+        inert on exactly the paths that must stay byte-identical.
+
+        **The clause choice is made here, and only here.** TL has two clauses and they are
+        not interchangeable, so the decision which one applies belongs where the engine's
+        own facts are known rather than inside the predicate:
+
+        * the two tokens that keep a round OPEN (`PREPARE_REPAIR`,
+          `PREPARE_PHASE_REVIEWER`) release nothing. `PREPARE_REPAIR` additionally marks
+          the role `repair_binding` names `REPAIR_PENDING`, which is the design's own
+          ordering: the defect is classified in VALIDATE_SETTLEMENT and the decision to
+          re-dispatch is ROUTE's, one node later;
+        * on any other token the engine has left this key, so the round closes. **Clause
+          1** is tried first -- every role REQUIRED by the round `VALIDATED` -- and when it
+          holds, that is the close. When it does not, the round is ending anyway (a gate
+          block, an escalation, a pause, a cancel, an abandon, or a phase/correction
+          transition after a role never reached `VALIDATED`), which is **clause 2**, and
+          the handles are disposed of by name.
+
+        Every observation is appended to :attr:`round_lifecycle_log` -- a diagnostic, never
+        an authority: nothing reads it to decide anything.
+        """
+        if event not in ROUND_LIFECYCLE_EVENTS:
+            return ()
+        lifetime = self.round_lifetime()
+        if lifetime is None:
+            return ()
+        if event in ("settled", "validated"):
+            if intent is None:
+                return ()
+            key = self.round_key_for_intent(intent)
+            role = _LIFECYCLE_ROLES.get(intent["role"], "")
+            if not role:
+                return ()
+            if event == "settled":
+                lifetime.settled(phase=key[0], attempt=key[1], role=role)
+            else:
+                lifetime.validated(phase=key[0], attempt=key[1], role=role)
+            self._log_round_lifecycle(event, key, role, ())
+            return ()
+        key = self._preparing_key
+        if key is None:
+            return ()
+        phase, attempt = key
+        if event == "dispose":
+            released = self.dispose_round(phase=phase, attempt=attempt, reason=reason)
+            self._log_round_lifecycle("dispose:clause2", key, reason, released)
+            return released
+        # ---- event == "route" -------------------------------------------------------
+        # The run's own risk, read off the engine's validated state rather than guessed:
+        # it is what the required-role set quantifies over, and `routing.phase_gate`
+        # reads the same field.
+        if risk:
+            lifetime.risk = risk
+        if token == "PREPARE_REPAIR":
+            # A STATE TRANSITION, not a decision: the engine has already decided to
+            # re-dispatch this role, and `repair_binding` is its own statement of which
+            # role that is.  Applied BEFORE the predicate is asked, because the predicate
+            # reads role states.
+            role = _LIFECYCLE_ROLES.get(repair_role, "")
+            if role:
+                lifetime.repair_pending(phase=phase, attempt=attempt, role=role)
+        # ---- the PREDICATE decides whether clause 1 closes.  Nothing above this line
+        # ---- short-circuits it, and that is load-bearing: a clause-1 close is TL's
+        # ---- `(1a) AND (1b)` and `(1b)` lives INSIDE the predicate.  An earlier edition
+        # ---- of this method answered `PREPARE_PHASE_REVIEWER` with a hold of its own,
+        # ---- which re-implemented (1b) out here and made the predicate's own copy dead
+        # ---- at exactly the boundary it exists for -- so a hook whose (1a) quantifies
+        # ---- over DISPATCHED roles, or which ignores (1b) altogether, was masked by the
+        # ---- adapter and produced a correct-looking round.  The negative controls in
+        # ---- `test_os14_round_lifetime` are what catch that, and they only can if the
+        # ---- predicate is asked first.
+        released = self.observe_round_route(token, phase=phase, attempt=attempt)
+        if released:
+            self._log_round_lifecycle("route:close:clause1", key, token, released)
+            return released
+        if lifetime.round_closes(token, phase=phase, attempt=attempt):
+            # Clause 1 held and there was simply nothing prepared under this key -- a LOW
+            # round prepares no pair at all, and a FINAL_REVIEW round prepares nothing
+            # either. Recorded as the clause-1 close it is rather than as a disposal.
+            self._log_round_lifecycle("route:close:clause1", key, token, ())
+            return ()
+        if token in _round_open_tokens():
+            # The round is OPEN: this token either re-dispatches this role or dispatches
+            # another role of this same round.  Held -- and the question asked here is
+            # NOT the one the predicate just answered: the predicate said "clause 1 does
+            # not close"; this says "and the engine has not left this key either", which
+            # is the only thing that distinguishes a hold from a clause-2 disposal.
+            self._log_round_lifecycle(
+                "route:hold:repair" if token == "PREPARE_REPAIR"
+                else "route:hold:reviewer", key, token, ())
+            return ()
+        # Clause 2: the engine emitted a token that leaves this key while some role
+        # REQUIRED by the round never reached `VALIDATED` -- a gate block, an escalation,
+        # a pause, a cancel, an abandon, or a phase/correction transition.  The round is
+        # ending either way, so its targets are disposed of by name.
+        released = self.dispose_round(phase=phase, attempt=attempt, reason=f"route:{token}")
+        self._log_round_lifecycle("route:close:clause2", key, token, released)
+        return released
+
+    def round_key_for_intent(self, intent: Any) -> tuple:
+        """The round key for one intent -- the SAME derivation `start()` records.
+
+        Spelled once, here, so the dispatch that prepares handles and the observation that
+        releases them cannot disagree about which round they are talking about.
+        """
+        return (artifact_identity.contract_phase(intent["role"], intent["phase"]),
+                intent["gate_iteration"])
+
+    def _log_round_lifecycle(self, event: str, key: tuple, detail: Any,
+                             released: tuple) -> None:
+        """Append one DIAGNOSTIC row.  Nothing reads this to decide anything.
+
+        It exists because the engine connection is otherwise only observable through its
+        effects, and an effect that is correctly ZERO -- a hold, or a close with no handle
+        prepared -- is indistinguishable from a connection that never fired. The row makes
+        the two distinguishable, which is what lets an end-to-end test assert the HOLD and
+        the clause of every close rather than only the release count.
+        """
+        self.round_lifecycle_log.append(
+            {"event": event, "phase": key[0] if key else "",
+             "gate_iteration": key[1] if key else "", "detail": detail,
+             "released": tuple(released)})
+
+    def dispose_round(self, *, phase: Any, attempt: Any, reason: str = "") -> tuple:
+        """TL clause 2: a refusal, a Gate B failure, a delivery failure, a cancel, an
+        abandon or a pause.  Releases every handle prepared under the key, once."""
+        lifetime = self.round_lifetime()
+        return () if lifetime is None else lifetime.dispose(
+            phase=phase, attempt=attempt, reason=reason)
+
+    def _release_preparing_round(self, reason: str) -> tuple:
+        """Clause 2 for the round preparation is currently inside, if any.
+
+        TL row 13's own disposer: the `_refuse_preparation` path. Recorded in
+        `round_lifecycle_log` beside the engine's own observations, so a refusal's disposal
+        is as visible as a route's -- including the case where it correctly releases
+        NOTHING because the refusal fired before any create.
+        """
+        if self._preparing_key is None:
+            return ()
+        phase, attempt = self._preparing_key
+        released = self.dispose_round(phase=phase, attempt=attempt, reason=reason)
+        self._log_round_lifecycle("dispose:clause2", self._preparing_key, reason,
+                                  released)
+        return released
 
     def capabilities(self) -> frozenset[str]:
         """The capabilities Orca's primitives actually support -- and no others.
@@ -269,6 +609,65 @@ class OrcaAdapter:
                 "FINAL_REVIEWER": "final_reviewer"}[intent["role"]]
 
     def start(self, intent: ActionIntent, *, lease_token: str | None = None) -> dict[str, Any]:
+        """The dispatch, plus TL clause 2's ONE connection to the whole of it.  PR40-B2.
+
+        ``_start_dispatch`` is the shipped method, unchanged in substance; this wrapper
+        adds the disposal that clause 2 already promised and that nothing wired.
+
+        **Why one wrapper rather than a handler per boundary.**  Four different failures
+        leave this method with a round's sessions created and nothing to tear them down:
+        a bind the driver does not confirm, a preparation pre-pass refusal, a REAL Gate B
+        refusal (which happens inside ``run_existing_task``, one frame below), and a
+        delivery failure after the Task exists.  Only the first two are even inside
+        ``_prepare_pair``, and none of the four reaches ``_refuse_preparation`` or the
+        engine's post-settlement observer -- which is why fixing either of those two
+        places could not have closed PR40-B2.  Every one of them leaves *this* call by an
+        exception, so this is the single frame that sees all four.
+
+        **What it preserves, exactly.**  The original exception is re-raised unchanged --
+        same type, same message, same traceback -- so every named refusal, the
+        ``IdempotencyRecoveryError`` projection and the exception-normalisation contracts
+        stand as they are; cleanup can turn no failure into a success.  ``BaseException``
+        is NOT caught, so ``KeyboardInterrupt`` / ``SystemExit`` / ``GeneratorExit``
+        propagate as themselves and a hard process exit still promises no cleanup at all
+        (TL row 14, unchanged).  And the disposal itself cannot raise over the original
+        failure: see ``_dispose_failed_dispatch``.
+        """
+        try:
+            return self._start_dispatch(intent, lease_token=lease_token)
+        except Exception as exc:          # noqa: BLE001 - re-raised below, unchanged
+            self._dispose_failed_dispatch(intent, exc)
+            raise
+
+    def _dispose_failed_dispatch(self, intent: ActionIntent, exc: Exception) -> tuple:
+        """TL clause 2 for a dispatch that failed.  Never raises, never masks.  PR40-B2.
+
+        Scoped to THIS intent's round by comparing the key preparation is currently inside
+        against ``round_key_for_intent(intent)`` -- the same derivation ``start`` itself
+        records -- so a failure raised before this call entered a round (an
+        ``IDEMPOTENCY_CONFLICT`` on the receipt, say) cannot dispose of some PREVIOUS
+        round's targets, and a failure inside this round always disposes of exactly it.
+
+        Totality is the other half.  Every caller is already on a failure path, so an
+        exception escaping here would REPLACE the failure being cleaned up after; it is
+        therefore recorded as its own diagnostic row and swallowed.  The per-handle
+        resilience is one level down, in ``RoundTargetLifetime._close``, which is what
+        keeps one handle's failed teardown from cancelling the others'.
+        """
+        try:
+            key = self._preparing_key
+            if key is None or tuple(key) != tuple(self.round_key_for_intent(intent)):
+                return ()
+            return self._release_preparing_round(
+                f"dispatch_failure:{type(exc).__name__}")
+        except Exception as cleanup_error:  # noqa: BLE001 - diagnosed, never propagated
+            self._log_round_lifecycle(
+                "dispose:clause2:error", self._preparing_key or ("", ""),
+                _safe_error_text(cleanup_error), ())
+            return ()
+
+    def _start_dispatch(self, intent: ActionIntent, *,
+                        lease_token: str | None = None) -> dict[str, Any]:
         """Create the Task once, recording its identity under the caller's lease.
 
         Every ledger write below is fenced by ``lease_token``: an executor whose lease was
@@ -293,6 +692,20 @@ class OrcaAdapter:
         # so the dispatched task context, the artifact path and the applied result can no
         # longer disagree about which gate attempt this was.
         iteration = intent["gate_iteration"]
+        # ---- OS-14 I-7: the ROUND KEY this dispatch belongs to, recorded BEFORE any
+        #      effect and for EVERY dispatch -- not only the ones that prepare a pair.
+        #
+        # It is `(contract_phase, gate_iteration)`, which is exactly the key
+        # `_prepare_pair` registers its handles under, so the dispatch that prepares and
+        # the observation that releases can never disagree about which round they mean.
+        # Recorded HERE rather than re-derived at observation time because
+        # `apply_result_node` advances `phase_iterations` for the gate round that just
+        # settled: `artifact_identity.gate_iteration` evaluated at ROUTE would name the
+        # NEXT round, and the round that is closing is the one that just ran.
+        #
+        # Set before `_assert_preparation_binding` so a binding refusal is scoped to this
+        # key too -- correctly releasing nothing, because nothing has been created yet.
+        self._preparing_key = (phase, iteration)
         # ---- OS-14: the LAUNCH-RECORD check.  UNCONDITIONAL, before ANY effect, and
         #      deliberately OUTSIDE the pair_admission_required guard. ----
         self._assert_preparation_binding(intent)
@@ -453,6 +866,13 @@ class OrcaAdapter:
         same lazy import.
         """
         assert code in PAIR_PREPARATION_REFUSAL_CODES, code    # a typo cannot ship
+        # ---- OS-14 I-7, TL clause 2: this is the ONE exit, so it is the ONE place a
+        # refusal's cleanup belongs.  Every handle prepared under the round being
+        # prepared is released exactly once, and a refusal raised BEFORE any create
+        # finds nothing to release -- which is the correct answer, not a missing one.
+        # Placed before the raise and swallowing nothing: a teardown never replaces the
+        # refusal it is cleaning up after.
+        self._release_preparing_round(f"refusal:{code}")
         from .executor import IdempotencyRecoveryError          # lazy, as standalone does
         raise IdempotencyRecoveryError(code, message)
 
@@ -553,6 +973,11 @@ class OrcaAdapter:
         run_id = getattr(self.harness, "run_id", "") or ""
         selector = ((planned or {}).get("terminal_worktree")
                     or self.origin_worktree_selector())
+        # OS-14 I-7.  The round key is published BEFORE the first read and therefore
+        # before the first effect, so every refusal from here on knows which round's
+        # targets to release -- including the refusals that fire before anything was
+        # created, for which the release set is correctly EMPTY.
+        self._preparing_key = (phase, attempt)
         try:
             entries = {role: store.entry(phase, attempt, role) for role in _PAIR_ROLES}
             prepared_any = store.has_any()
@@ -796,6 +1221,14 @@ class OrcaAdapter:
                 revoke(handle)
             except Exception:  # noqa: BLE001 - a revocation never replaces the refusal
                 pass
+        # ---- OS-14 I-7, TL: `_revoke_model_authority` is one of the paths TL names by
+        # name.  Every call site of this helper is immediately followed by a
+        # `_refuse_preparation`, so the round is ending; releasing the round's targets
+        # here as well as there is harmless because `release(handle)` is IDEMPOTENT and
+        # the round key is closed once.  The AUTHORITY revocation above and the TARGET
+        # release below are deliberately two statements: authority is about what a record
+        # may still claim, and the target is about what is still live.
+        self._release_preparing_round("model_authority_revoked")
 
     def _prepare_role(self, *, role: str, phase: str, attempt: Any, selector: str,
                       run_id: str, store: Any, entry: dict[str, Any] | None,
@@ -814,7 +1247,20 @@ class OrcaAdapter:
                 # anything reads harness ledger state for it.  Idempotent: a handle this
                 # process created is already in the ledger and keeps its own provenance.
                 self.harness.adopt_prepared_terminal(verdict["handle"], role, phase=phase)
+                # OS-14 I-7, TL: an ADOPTED handle is a target of THIS round too -- this
+                # is the repair turn re-entering the round that prepared it -- so it is
+                # registered under the SAME key and released once, at that round's close.
+                # Idempotent for a handle already registered under the key.
+                lifetime = self.round_lifetime()
+                if lifetime is not None:
+                    lifetime.prepared(phase=phase, attempt=attempt, role=role,
+                                      handle=verdict["handle"])
                 return verdict["handle"]
+            # OS-14 I-7, TL: the reuse gate REFUSED this session, so a new one is about to
+            # be created and the superseded target is finished with.  Released here, on
+            # the supersession path, which is the existing path rather than a TL special
+            # case -- TL keeps a target available, it never overrules the gate.
+            self._release_target(verdict["handle"])
         if verdict["action"] == "block":
             self._refuse_preparation(
                 verdict["code"],
@@ -827,6 +1273,24 @@ class OrcaAdapter:
                           + (1 if entry["stage"] == "CREATE_REFUSED"
                              or supersede is not None else 0))
         title = self._pair_terminal_title(phase=phase, attempt=attempt, role=role)
+        # ---- OS-14 I-1: the LAUNCH LEASE, minted strictly BEFORE the external effect --
+        # The mint rule, in code: EVERY path that reaches a create mints a NEW token --
+        # the first create (`entry is None`), the retry after a parsed `CREATE_REFUSED`
+        # (where the runtime's own receipt proves nothing was created) and a reuse-gate
+        # supersession -- and the superseded entry's token is REVOKED by the mint itself,
+        # in the same statement group that publishes the replacement.  There is no path
+        # that re-exercises a recorded token for a second create.
+        #
+        # `mint_launch_lease` is gated on the rule HC, so with no hosted-capable driver it
+        # returns None, writes no cell and derives no endpoint: the session prepared below
+        # is GENUINELY legacy and the default path is unchanged, byte for byte.
+        superseded_token = (entry or {}).get("launch_token", "") if (
+            entry is not None and (entry["stage"] == "CREATE_REFUSED"
+                                   or supersede is not None)) else ""
+        mint = getattr(self.harness, "mint_launch_lease", None)
+        lease = (mint(role=role, phase=phase, attempt=attempt,
+                      create_attempt=create_attempt, supersedes=superseded_token)
+                 if callable(mint) else None)
         # ---- 1. INTENT, strictly BEFORE the external effect -------------------------
         store.record(phase, attempt, role, stage="CREATE_INTENDED",
                      create_attempt=str(create_attempt), terminal_title=title,
@@ -835,7 +1299,12 @@ class OrcaAdapter:
                      create_intended_at=_now(),
                      # PROVENANCE of a superseding attempt, written in the SAME call that
                      # publishes it, so a replacement can never read as a first create.
-                     **(supersede or {}))
+                     **(supersede or {}),
+                     # OS-14 I-4: the lease's five cells, in the SAME write.  A new create
+                     # attempt clears the previous attempt's lease cells first
+                     # (`_PAIR_ENTRY_ATTEMPT_CLEARED`), so a supersession's new token and
+                     # the superseded token's disappearance from the slot are one write.
+                     **(lease.durable_cells() if lease is not None else {}))
         # ---- 2. the ONLY external effect of preparation ------------------------------
         try:
             handle = self.harness.create_fake_terminal(
@@ -862,6 +1331,45 @@ class OrcaAdapter:
         # ---- 3. IDENTITY, only AFTER observation -------------------------------------
         store.record(phase, attempt, role, stage="CREATED", create_settled_at=_now(),
                      terminal_digest=pause_policy.terminal_digest(handle))
+        # ---- OS-14 I-7, TL / PR40-B2: the DISPOSAL TARGET, before any failable bind ---
+        # The handle is now CONFIRMED BY ITS CREATE RECEIPT and its digest is on record,
+        # so this is the first moment the round can name it -- and it must name it HERE,
+        # strictly before the two calls below, because both of them can fail.
+        #
+        # PR40-B2 was this registration standing AFTER them: a bind the driver did not
+        # confirm (`DRIVER_BIND_UNCONFIRMED`) raised out of a handle that no round had
+        # claimed, so TL clause 2 had nothing to release for it and the session, its lease
+        # and -- for the counterpart -- its binding all outlived the round that created
+        # them.  A `dispose_round()` called afterwards could not reach it either, which is
+        # what made the omission permanent rather than merely late.
+        #
+        # **Registration is not a binding success and not a model-verification success.**
+        # It is the statement "this round created this session and therefore owes its
+        # teardown", which is true the instant the receipt is in hand and stays true
+        # whether the bind, the verification and the delivery succeed or fail.  Nothing
+        # downstream reads it as permission: `bind_prepared_target` still has to bind,
+        # step 4f still has to re-verify, and the barrier still has to admit the delivery.
+        # Nor does it invent anything: only a handle a receipt reported reaches this line,
+        # and no session is adopted here by title.
+        lifetime = self.round_lifetime()
+        if lifetime is not None:
+            lifetime.prepared(phase=phase, attempt=attempt, role=role, handle=handle)
+        # ---- OS-14 I-1/I-7: the POST-CREATE BIND, the ONE statement of P-8 -----------
+        # Immediately after the `CREATED` write and the registration above, and nowhere
+        # else.  The handle does not exist before `create_fake_terminal` returns and its
+        # digest is recorded only here, so this is the first moment either can be stated
+        # -- and the harness, which holds the create receipt, is the only party that can
+        # state them.  No frame authored by the launched process may carry them.
+        #
+        # ONE call, and NO new refusal branch: a failed bind leaves the target unbound and
+        # the verification loop's existing unconditional re-verification refuses it
+        # through `PAIR_PREPARATION_MODEL_UNOBSERVED`.  `bind_prepared_target` returns
+        # `not_hosted` and changes nothing when HC does not hold.
+        if lease is not None:
+            self.harness.bind_launch_lease(lease.launch_token, handle)
+            binder = getattr(self.harness, "bind_prepared_target", None)
+            if callable(binder):
+                binder(handle, role=role, phase=phase, attempt=attempt)
         return handle
 
     def _reuse_verdict(self, *, role: str, phase: str, attempt: Any, store: Any,

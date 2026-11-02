@@ -12,7 +12,8 @@ from . import audit
 from .audit_wrapper import _audited
 from .executor import (advance_phase_node, apply_result_node, audit_gate_transition,
                        audit_repair_request, audit_terminal, dispose_node,
-                       execute_intent_node, pause_node, prepare_intent_node, route_node,
+                       execute_intent_node, lifecycle_bound, pause_node,
+                       prepare_intent_node, round_lifecycle_observer, route_node,
                        terminal_node, validate_node, validate_settlement_node)
 from .graph_spec import NODES, ROUTE_TARGETS, validate_graph_spec
 from .runtime_state import resolve_runtime_state
@@ -408,26 +409,37 @@ def build_graph(adapter: Any, *, checkpointer: Any = None, runtime_state: Any = 
     approval = (approval_port if approval_port is not None
                 else getattr(adapter, "approval_port", None))
     journal = journal if journal is not None else getattr(adapter, "settlement_journal", None)
+    # ---- OS-14 I-7: the round-lifecycle observer, resolved ONCE, here ---------------
+    # The adapter owns target lifetime; the engine owns every decision.  Resolving the
+    # port at build time rather than per node call means a node cannot acquire a different
+    # observer half way through a run, and an adapter with no port -- the fake adapter, a
+    # legacy run, a `None` driver -- yields `None` and every call site below is inert.
+    lifecycle = round_lifecycle_observer(adapter)
     graph = StateGraph(WorkflowState)
     graph.add_node("VALIDATE", _audited(validate_node, audit_sink, None))
-    graph.add_node("ROUTE", _audited(route_node, audit_sink, None))
+    graph.add_node("ROUTE",
+                   _audited(lifecycle_bound(route_node, lifecycle), audit_sink, None))
     graph.add_node("ADVANCE_PHASE", _audited(advance_phase_node, audit_sink, None))
     graph.add_node("PREPARE_INTENT",
                    _audited(prepare_intent_node, audit_sink, audit_repair_request))
     graph.add_node("EXECUTE_INTENT",
-                   _fenced(_audited(execute_intent_node(adapter, ledger), audit_sink,
-                                    None), fence))
+                   _fenced(_audited(execute_intent_node(adapter, ledger,
+                                                        lifecycle=lifecycle),
+                                    audit_sink, None), fence))
     gate_policy, gate_classifier = _resolve_gate_contract(skill_path)
     graph.add_node("VALIDATE_SETTLEMENT",
-                   _audited(validate_settlement_node(gate_policy, gate_classifier),
+                   _audited(validate_settlement_node(gate_policy, gate_classifier,
+                                                     lifecycle=lifecycle),
                             audit_sink, audit_gate_transition))
     graph.add_node("APPLY_RESULT", _audited(apply_result_node, audit_sink, None))
     graph.add_node("PAUSE", _fenced(pause_node(settlement, approval, clock=clock,
                                                skill_path=skill_path, journal=journal,
-                                               sources_provider=sources_provider),
+                                               sources_provider=sources_provider,
+                                               lifecycle=lifecycle),
                                     fence))
     graph.add_node("DISPOSE", _fenced(dispose_node(settlement, clock=clock,
-                                                   journal=journal), fence))
+                                                   journal=journal,
+                                                   lifecycle=lifecycle), fence))
     graph.add_node("TERMINAL",
                    _audited(terminal_node, audit_sink, audit_terminal))
     graph.add_edge(START, "VALIDATE")
