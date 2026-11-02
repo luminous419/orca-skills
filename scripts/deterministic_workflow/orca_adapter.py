@@ -149,6 +149,26 @@ def _default_result_parser(attempt: Any, intent: ActionIntent) -> dict[str, Any]
     return decision_contract.parse_agent_settlement(attempt, intent)
 
 
+def _safe_error_text(exc: BaseException) -> str:
+    """``f"{type(exc).__name__}: {exc}"`` -- but a diagnostic may never replace the failure
+    it is diagnosing.
+
+    The same rule ``orca_runtime_harness.safe_exception_text`` states, spelled here rather
+    than imported because this package takes no runtime import.  The caught object on the
+    one path that uses this reaches the model DRIVER's own ``release_target``, so it is not
+    necessarily this repository's and its ``__str__`` is free to raise.  Ordinary
+    ``Exception`` from the render is handled; control-flow exceptions propagate as
+    themselves, exactly as the runtime's helper does.
+    """
+    try:
+        return f"{type(exc).__name__}: {exc}"
+    except Exception:                   # noqa: BLE001 - the render itself failed
+        try:
+            return f"{type(exc).__name__}: <unrenderable>"
+        except Exception:               # noqa: BLE001 - even the type name failed
+            return "<unrenderable error>"
+
+
 class OrcaAdapter:
     """Synchronous façade over ``create_task`` and ``run_existing_task``."""
 
@@ -206,14 +226,26 @@ class OrcaAdapter:
     # ---- OS-14 I-7: the round-scoped target lifetime --------------------------------
     def _read_durable_launch_lease(self, *, role: str, phase: Any,
                                    attempt: Any) -> dict[str, Any] | None:
-        """The barrier's DURABLE lease read.  Unreadable is `None`, never permission."""
+        """The barrier's DURABLE lease read.  Unreadable is never permission.
+
+        `None` means ONE thing and one thing only: the document POSITIVELY states this run
+        recorded no launch for this slot (`PairPreparationStore.launch_lease` answers
+        `None` for an absent entry and for an entry with no `launch_token`, and both are
+        that statement -- an absent or truncated document never reaches it, because
+        `_read_document` refuses it by name first).
+
+        **PR40-B1.**  A store error is therefore RAISED rather than mapped onto `None`.
+        It used to be mapped, which made "the record cannot be read" indistinguishable
+        from "there is no record", and the barrier's obligation check cannot afford that
+        conflation: an unreadable record is not evidence that a session was never
+        launched.  The harness's own `_launch_provenance` catches it and names it
+        `unreadable`, and the leg that only needs a yes/no (`_durable_launch_lease`) still
+        reads it as "not confirmed", which is the fail-closed answer it always gave.
+        """
         store = self.pair_preparation
         if store is None:
             return None
-        try:
-            return store.launch_lease(phase, attempt, role)
-        except pause_store.PauseStoreError:
-            return None
+        return store.launch_lease(phase, attempt, role)
 
     def round_lifetime(self) -> Any:
         """The ONE TL tracker for this adapter, or `None` on a harness without one.
@@ -577,6 +609,65 @@ class OrcaAdapter:
                 "FINAL_REVIEWER": "final_reviewer"}[intent["role"]]
 
     def start(self, intent: ActionIntent, *, lease_token: str | None = None) -> dict[str, Any]:
+        """The dispatch, plus TL clause 2's ONE connection to the whole of it.  PR40-B2.
+
+        ``_start_dispatch`` is the shipped method, unchanged in substance; this wrapper
+        adds the disposal that clause 2 already promised and that nothing wired.
+
+        **Why one wrapper rather than a handler per boundary.**  Four different failures
+        leave this method with a round's sessions created and nothing to tear them down:
+        a bind the driver does not confirm, a preparation pre-pass refusal, a REAL Gate B
+        refusal (which happens inside ``run_existing_task``, one frame below), and a
+        delivery failure after the Task exists.  Only the first two are even inside
+        ``_prepare_pair``, and none of the four reaches ``_refuse_preparation`` or the
+        engine's post-settlement observer -- which is why fixing either of those two
+        places could not have closed PR40-B2.  Every one of them leaves *this* call by an
+        exception, so this is the single frame that sees all four.
+
+        **What it preserves, exactly.**  The original exception is re-raised unchanged --
+        same type, same message, same traceback -- so every named refusal, the
+        ``IdempotencyRecoveryError`` projection and the exception-normalisation contracts
+        stand as they are; cleanup can turn no failure into a success.  ``BaseException``
+        is NOT caught, so ``KeyboardInterrupt`` / ``SystemExit`` / ``GeneratorExit``
+        propagate as themselves and a hard process exit still promises no cleanup at all
+        (TL row 14, unchanged).  And the disposal itself cannot raise over the original
+        failure: see ``_dispose_failed_dispatch``.
+        """
+        try:
+            return self._start_dispatch(intent, lease_token=lease_token)
+        except Exception as exc:          # noqa: BLE001 - re-raised below, unchanged
+            self._dispose_failed_dispatch(intent, exc)
+            raise
+
+    def _dispose_failed_dispatch(self, intent: ActionIntent, exc: Exception) -> tuple:
+        """TL clause 2 for a dispatch that failed.  Never raises, never masks.  PR40-B2.
+
+        Scoped to THIS intent's round by comparing the key preparation is currently inside
+        against ``round_key_for_intent(intent)`` -- the same derivation ``start`` itself
+        records -- so a failure raised before this call entered a round (an
+        ``IDEMPOTENCY_CONFLICT`` on the receipt, say) cannot dispose of some PREVIOUS
+        round's targets, and a failure inside this round always disposes of exactly it.
+
+        Totality is the other half.  Every caller is already on a failure path, so an
+        exception escaping here would REPLACE the failure being cleaned up after; it is
+        therefore recorded as its own diagnostic row and swallowed.  The per-handle
+        resilience is one level down, in ``RoundTargetLifetime._close``, which is what
+        keeps one handle's failed teardown from cancelling the others'.
+        """
+        try:
+            key = self._preparing_key
+            if key is None or tuple(key) != tuple(self.round_key_for_intent(intent)):
+                return ()
+            return self._release_preparing_round(
+                f"dispatch_failure:{type(exc).__name__}")
+        except Exception as cleanup_error:  # noqa: BLE001 - diagnosed, never propagated
+            self._log_round_lifecycle(
+                "dispose:clause2:error", self._preparing_key or ("", ""),
+                _safe_error_text(cleanup_error), ())
+            return ()
+
+    def _start_dispatch(self, intent: ActionIntent, *,
+                        lease_token: str | None = None) -> dict[str, Any]:
         """Create the Task once, recording its identity under the caller's lease.
 
         Every ledger write below is fenced by ``lease_token``: an executor whose lease was
@@ -1240,12 +1331,35 @@ class OrcaAdapter:
         # ---- 3. IDENTITY, only AFTER observation -------------------------------------
         store.record(phase, attempt, role, stage="CREATED", create_settled_at=_now(),
                      terminal_digest=pause_policy.terminal_digest(handle))
-        # ---- OS-14 I-1/I-7: the POST-CREATE BIND, the ONE statement of P-8 ------------
-        # Immediately after the `CREATED` write, and nowhere else.  The handle does not
-        # exist before `create_fake_terminal` returns and its digest is recorded only
-        # here, so this is the first moment either can be stated -- and the harness, which
-        # holds the create receipt, is the only party that can state them.  No frame
-        # authored by the launched process may carry them.
+        # ---- OS-14 I-7, TL / PR40-B2: the DISPOSAL TARGET, before any failable bind ---
+        # The handle is now CONFIRMED BY ITS CREATE RECEIPT and its digest is on record,
+        # so this is the first moment the round can name it -- and it must name it HERE,
+        # strictly before the two calls below, because both of them can fail.
+        #
+        # PR40-B2 was this registration standing AFTER them: a bind the driver did not
+        # confirm (`DRIVER_BIND_UNCONFIRMED`) raised out of a handle that no round had
+        # claimed, so TL clause 2 had nothing to release for it and the session, its lease
+        # and -- for the counterpart -- its binding all outlived the round that created
+        # them.  A `dispose_round()` called afterwards could not reach it either, which is
+        # what made the omission permanent rather than merely late.
+        #
+        # **Registration is not a binding success and not a model-verification success.**
+        # It is the statement "this round created this session and therefore owes its
+        # teardown", which is true the instant the receipt is in hand and stays true
+        # whether the bind, the verification and the delivery succeed or fail.  Nothing
+        # downstream reads it as permission: `bind_prepared_target` still has to bind,
+        # step 4f still has to re-verify, and the barrier still has to admit the delivery.
+        # Nor does it invent anything: only a handle a receipt reported reaches this line,
+        # and no session is adopted here by title.
+        lifetime = self.round_lifetime()
+        if lifetime is not None:
+            lifetime.prepared(phase=phase, attempt=attempt, role=role, handle=handle)
+        # ---- OS-14 I-1/I-7: the POST-CREATE BIND, the ONE statement of P-8 -----------
+        # Immediately after the `CREATED` write and the registration above, and nowhere
+        # else.  The handle does not exist before `create_fake_terminal` returns and its
+        # digest is recorded only here, so this is the first moment either can be stated
+        # -- and the harness, which holds the create receipt, is the only party that can
+        # state them.  No frame authored by the launched process may carry them.
         #
         # ONE call, and NO new refusal branch: a failed bind leaves the target unbound and
         # the verification loop's existing unconditional re-verification refuses it
@@ -1256,11 +1370,6 @@ class OrcaAdapter:
             binder = getattr(self.harness, "bind_prepared_target", None)
             if callable(binder):
                 binder(handle, role=role, phase=phase, attempt=attempt)
-        # OS-14 I-7, TL: the target is now `ACTIVE` for this round, and the round holds it
-        # until the ROUND closes -- not until this role settles.
-        lifetime = self.round_lifetime()
-        if lifetime is not None:
-            lifetime.prepared(phase=phase, attempt=attempt, role=role, handle=handle)
         return handle
 
     def _reuse_verdict(self, *, role: str, phase: str, attempt: Any, store: Any,

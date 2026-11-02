@@ -2125,9 +2125,23 @@ if options["mode"] != "rebound":
 elif options.get("driver_class") == "attesting":
     from scripts.test_os14_pair_preparation import _AttestingDriver
     driver = _AttestingDriver(resolve_map=drift)
+elif options.get("driver_class") == "lease_citing":
+    # PR40-B1.  The HOSTED-CAPABLE reference driver, and deliberately the SAME CLASS the
+    # predecessor used -- the driver class is part of the launch identity by design.  It
+    # cites whatever the ticket tells it about, which in a successor process is the
+    # ticket's own `""` / `0`: the NATURAL empty citation, not a forced one.  Imported
+    # lazily because `test_os14_launch_lease` imports THIS module.
+    from scripts.test_os14_launch_lease import LeaseCitingDriver
+    driver = LeaseCitingDriver(
+        resolve=lambda requested: drift.get(requested, requested))
 else:
     driver = InProcessModelDriver(
         resolve=lambda requested: drift.get(requested, requested))
+
+#: The successor's OWN harness, captured for the lease/binding reads below.  A successor
+#: must hold NEITHER, and the report says so with a positive observation rather than by
+#: omission.
+built = {}
 
 
 def harness_factory(artifact_base, **kwargs):
@@ -2136,6 +2150,7 @@ def harness_factory(artifact_base, **kwargs):
     harness = OrcaRuntimeHarness(Path(artifact_base), **kwargs)
     harness._exec_orca = recorder
     harness.preflight = lambda: {}
+    built["harness"] = harness
     return harness
 
 
@@ -2201,6 +2216,21 @@ report["started_task_ids"] = sorted({c[c.index("--task") + 1] for c in recorder.
 report["sends"] = recorder.count("terminal", "send")
 report["driver_legs"] = [] if driver is None else list(driver.requests)
 report["registered_from_test_code"] = False
+#: PR40-B1 / PR40-B2.  Counted, never inferred: the `dispatch` verb, the driver's own
+#: bind calls, and -- for each session the world outside reports -- whether THIS process
+#: ended up holding a live lease or a live binding for it.  A successor that passed
+#: verification without either is exactly the defect, and a successor that acquired
+#: either would be the over-correction (no rebind, no relaunch, no recovery).
+report["dispatches"] = sum(1 for c in recorder.commands if c[1:2] == ("dispatch",))
+report["driver_binds"] = [] if driver is None else [
+    list(bind[:2]) for bind in getattr(driver, "binds", [])]
+_harness = built.get("harness")
+report["live_leases"] = [] if _harness is None else [
+    row["handle"] for row in options["listing"]
+    if _harness.launch_lease_for_handle(row["handle"]) is not None]
+report["live_bindings"] = [] if _harness is None else [
+    row["handle"] for row in options["listing"]
+    if _harness.prepared_target(row["handle"]) is not None]
 #: THE RECOVERY AUDIT.  `claim_log` is what the durable store ANSWERED this process, in
 #: order; `[..., "RESUMED"]` for the predecessor's intent is the proof that this child took
 #: over an existing CLAIMED record instead of opening a fresh one.  `lookup_rungs` is the

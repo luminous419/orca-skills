@@ -466,7 +466,14 @@ class BlockingStartContractTests(unittest.TestCase):
         # which awaits completion and settles a SUCCESS and a TYPED FAILURE alike.  The
         # sources are read together so the property is "this path settles", not "this one
         # function contains the call".
-        for label, functions in (("orca", (OrcaAdapter.start,)),
+        # PR40-B2 re-derived the ORCA entry: `OrcaAdapter.start` is now the port's one
+        # failure-disposal wrapper around `_start_dispatch`, which is the shipped body.
+        # The two are read TOGETHER for exactly the reason the standalone pair is -- the
+        # property is "this adapter's start PATH settles", not "this one function
+        # contains the call" -- so the assertion below is unchanged and still fails if
+        # the orca path ever stops settling.  Re-derived, not relaxed.
+        for label, functions in (("orca", (OrcaAdapter.start,
+                                           OrcaAdapter._start_dispatch)),
                                  ("fake", (FakeAdapter.start,)),
                                  ("standalone", (StandaloneSession.run_dispatch,
                                                  StandaloneSession._complete))):

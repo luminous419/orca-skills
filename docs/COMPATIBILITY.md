@@ -1198,12 +1198,33 @@ No provider flag, syntax or stream grammar is invented anywhere in this release.
 carries the same two read-only values so a conforming driver knows **which** launch it is
 being asked to re-validate.
 
-The new leg **(a2)** runs after the request leg and performs **five** checks, every one of
-them an equality or an integer order over a value this harness issued — no provider
-knowledge, no stream parsing, no trust in the driver anywhere in the leg:
+**Whether the leg runs is decided by PROVENANCE, not by the presence of evidence (PR40-B1).**
+The first edition entered the leg only when this process's registry held a lease for the
+session **or** the driver cited a token — which answered *must this launch be verified* with
+*is there any launch evidence to hand*. A successor process has an empty registry, so the
+ticket offers `launch_token: ""` / `launch_stamp: 0` and a **conforming** driver that cites
+what the ticket tells it about returns that empty citation; the leg was then skipped before
+the durable lease was read at all, and a session this run had demonstrably launched under a
+lease was verified by a process holding no lease and no binding for it. The obligation is now
+read off **this run's own durable record**, attributed to the target by run, phase, gate
+iteration, role and terminal digest — never off the registry, the citation or the current
+capability. An empty citation, an empty registry and an absent live target are **not**
+grounds for a legacy verdict. The durable provenance has **four** answers, not two, and the
+distinction is load-bearing: `recorded` (a lease is on file for this target), `no_launch_recorded`
+(the document positively states this run recorded none — the one answer that may read as
+genuinely **legacy**), and `unreadable` / `no_reader` (the question could not be answered).
+A reader failure, an absent reader and a corrupt record are **never** a verified no-lease
+state. The genuine legacy and reference-driver paths are unchanged: nothing records a lease
+for them, so nothing obliges them.
+
+The leg **(a2)** performs **six** checks — the obligation, then the five the first edition
+had — every one of them an equality or an integer order over a value this harness issued or
+this run itself durably wrote. No provider knowledge, no stream parsing, no trust in the
+driver anywhere in the leg:
 
 | Check | What it compares | Reported as |
 | --- | --- | --- |
+| **(a2-0) obligation** (PR40-B1) | the **durable** record names a launch for **this** target and this process holds no lease for it | `model_selection_request_absent`; a record already stamped revoked is `model_selection_request_stale`; an **unreadable** record is `model_selection_unverified` |
 | **(a2-1) citation** | a launch is cited **iff** one was minted for this session, and the cited token is one this harness minted | `model_selection_request_absent` |
 | **(a2-2) durability** | the citation is confirmed by the **durable** record; a lease that exists only in this process's memory is never sufficient | `model_selection_request_absent` |
 | **(a2-3) liveness** | neither the registry nor the record shows it revoked, and the session was not already released | `model_selection_request_stale` |
@@ -1232,7 +1253,11 @@ that attestation self-describing is I-10's and is deferred; the enforcement is n
 **A durable record restores nothing.** The lease registry and the target binding are
 in-process state, deliberately: the design's restart rule is a **named refusal**, so there
 is nothing durable to resurrect. A successor process starts with an empty registry, finds a
-durable lease it did not mint, and refuses — it never rebinds. A durable lease with no live
+durable lease it did not mint, and refuses — it never rebinds. **And it refuses whatever the
+driver cites, including nothing at all** (PR40-B1): the refusal is grounded in the durable
+record of the launch, so an empty citation cannot route around it. The refusal is also only
+a refusal — a successor mints no lease, binds nothing, relaunches nothing, attempts no
+recovery, and leaves the durable record exactly as it found it. A durable lease with no live
 channel is `DRIVER_TARGET_UNBOUND`; a second process under a recorded handle is
 `DRIVER_TARGET_REBOUND`; an unmatched bind echo is `DRIVER_BIND_UNCONFIRMED`. All three are
 driver-local target states reported through existing vocabulary members, and none of them is
@@ -1282,6 +1307,49 @@ both sides unlink and the authoritative "this endpoint is finished" fact is the 
 lease**, not the file. It does **not** terminate a CLI child and does **not** close an Orca
 terminal. A released session is also refused rather than silently read as legacy: a later
 verification of a released handle is `model_selection_request_stale`.
+
+**Clause 2 is connected to every FAILABLE part of a dispatch, not only to the refusal exit
+(PR40-B2).** The first edition registered a handle as its round's disposal target only
+**after** the post-create bind, and routed clause-2 disposal only through
+`_refuse_preparation` and the engine's post-settlement observer. Four failures therefore
+left a round's sessions, leases and bindings standing with nothing able to tear them down:
+a bind the driver did not confirm (`DRIVER_BIND_UNCONFIRMED`), a preparation **pre-pass**
+refusal, a **real Gate B** refusal (which happens one frame below, inside
+`run_existing_task`), and a delivery failure after the Task already existed. Two things
+changed and nothing else:
+
+- **the handle is registered as its round's disposal target the moment its create receipt
+  is in hand** — strictly before `bind_launch_lease` and `bind_prepared_target`, both of
+  which can fail. Registration is the statement *this round created this session and
+  therefore owes its teardown*; it is **not** a binding success and **not** a
+  model-verification success, nothing downstream reads it as permission, and only a handle
+  a receipt reported can reach it — no session is ever invented or adopted by title; and
+- **`OrcaAdapter.start` is the one frame that sees all four failures**, so clause 2 is
+  connected there. It is scoped to the round this call established (the key is compared
+  against the intent's own `(contract_phase, gate_iteration)`), so a failure raised before
+  the call entered a round cannot dispose of a previous one.
+
+**Cleanup never replaces the failure it is cleaning up after.** The original exception is
+re-raised unchanged, so every named refusal, the `IdempotencyRecoveryError` → BLOCKED
+projection and the exception-normalisation contracts stand exactly as they are, and no
+cleanup can turn a failure into a success. `BaseException` is **not** caught anywhere on
+this path, so `KeyboardInterrupt` / `SystemExit` / `GeneratorExit` propagate as themselves
+and **a hard process exit or `SIGKILL` still promises no cleanup at all** — that exclusion
+is unchanged. An additional error **during** cleanup is recorded as its own diagnostic
+(`RoundTargetLifetime.release_errors`, and a `dispose:clause2:error` row in
+`round_lifecycle_log`) and may not cancel the remaining handles' cleanup attempts: the
+disposal loop records a failed teardown and continues to the next handle.
+
+**With a healthy store the two halves of a release agree; with an unhealthy one, nothing
+claims they did.** `release(handle)` revokes the live lease and drops the binding, and the
+adapter's own half stamps `launch_revoked_at` on the durable record. The live half runs
+first, so an injected durable-write failure leaves the in-memory invalidation done, the
+remaining handles still cleaned up and the failure diagnosed — and the durable cleanup is
+reported as **not** having succeeded rather than assumed. A pre-delivery refusal (bind,
+pre-pass, Gate B) performs **zero** deliveries; a delivery failure after the Task and the
+delivery attempt exist preserves the obligation/UNKNOWN record the shipped path already
+writes, settles nothing successfully, re-delivers nothing and delivers to no other target.
+The authority/history separation and the shipped reuse gate are untouched.
 
 ### How the engine reports a round's lifetime (I-7's engine connection)
 

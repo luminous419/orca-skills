@@ -1017,6 +1017,27 @@ DRIVER_BIND_UNCONFIRMED = "DRIVER_BIND_UNCONFIRMED"
 DRIVER_TARGET_FAILURE_NAMES = (DRIVER_TARGET_UNBOUND, DRIVER_TARGET_REBOUND,
                                DRIVER_BIND_UNCONFIRMED)
 
+#: PR40-B1.  The FOUR answers the durable launch provenance can give, kept distinct
+#: because the defect was that three of them were collapsed onto one.  Like the three
+#: names above these are DIAGNOSTIC states and NOT members of the model-selection failure
+#: vocabulary: each is reported through an EXISTING member, and the closed vocabulary
+#: stays closed.
+#:
+#:   `recorded`           this run durably recorded a launch for the slot
+#:   `no_launch_recorded` the document POSITIVELY states it recorded none -- the one
+#:                        answer that may read as genuinely legacy
+#:   `unreadable`         the reader raised: a failure, or a corrupt record
+#:   `no_reader`          no durable reader is wired at all (construction-level axis)
+#:
+#: `unreadable` and `no_reader` are NOT `no_launch_recorded`: an unanswered question is
+#: unknown, never "it was fine".
+LAUNCH_PROVENANCE_RECORDED = "recorded"
+LAUNCH_PROVENANCE_NONE = "no_launch_recorded"
+LAUNCH_PROVENANCE_UNREADABLE = "unreadable"
+LAUNCH_PROVENANCE_NO_READER = "no_reader"
+LAUNCH_PROVENANCE_STATES = (LAUNCH_PROVENANCE_RECORDED, LAUNCH_PROVENANCE_NONE,
+                            LAUNCH_PROVENANCE_UNREADABLE, LAUNCH_PROVENANCE_NO_READER)
+
 def pair_terminal_digest(handle: str) -> str:
     """``sha256(handle)`` -- the ONE derivation, spelled to agree with
     ``deterministic_workflow.pause_policy.terminal_digest`` byte for byte.
@@ -1304,8 +1325,17 @@ class RoundTargetLifetime:
         self._states: dict[tuple[str, str], dict[str, str]] = {}
         #: keys whose round has already closed; a second close releases nothing more.
         self._closed: set[tuple[str, str]] = set()
-        #: handles released by THIS object, in call order, with their round key.
+        #: handles released by THIS object, in call order, with their round key.  One
+        #: entry per release ATTEMPT, appended before the attempt, so `release_count`
+        #: answers TL's own property -- one release per handle actually prepared -- for a
+        #: release that failed as well as for one that succeeded.
         self.releases: list[tuple[tuple[str, str], str]] = []
+        #: PR40-B2.  Releases that RAISED, as `(key, handle, "Type: message")`.  A
+        #: DIAGNOSTIC and never an authority: nothing reads it to decide anything.  It
+        #: exists because an additional error during cleanup must be recorded SEPARATELY
+        #: -- it may not mask the failure the cleanup is running after, and it may not
+        #: silently cancel the other prepared handles' cleanup attempts.
+        self.release_errors: list[tuple[tuple[str, str], str, str]] = []
 
     # ---- the key ---------------------------------------------------------------------
     @staticmethod
@@ -1426,6 +1456,25 @@ class RoundTargetLifetime:
         return self._close(phase=phase, attempt=attempt)
 
     def _close(self, *, phase: Any, attempt: Any) -> tuple[str, ...]:
+        """Release every handle prepared under this key, exactly once each.
+
+        **PR40-B2: TOTAL over ordinary exceptions, per handle.**  A release that raises --
+        a channel teardown that fails, a durable revocation the store refuses with
+        something other than its own typed error -- is RECORDED in `release_errors` and
+        the loop CONTINUES to the next handle.  Two properties depend on that and neither
+        is optional: an additional error during cleanup may not replace the failure this
+        disposal is cleaning up after (every caller here is already on a failure path, and
+        `_refuse_preparation` disposes BEFORE it raises its refusal), and it may not
+        silently cancel the cleanup of the handles that come after it.
+
+        `BaseException` still propagates: a `KeyboardInterrupt` in the middle of a
+        teardown is not a teardown failure, and TL row 14 promises no cleanup across a
+        hard exit anyway.
+
+        The returned tuple is the handles whose release COMPLETED, so a caller is never
+        told a disposal landed when it did not; `releases` / `release_count` count the
+        ATTEMPT, which is what "exactly once per prepared handle" is about.
+        """
         key = self.round_key(phase, attempt)
         if key in self._closed:
             return ()
@@ -1433,8 +1482,17 @@ class RoundTargetLifetime:
         released: list[str] = []
         for handle in self.prepared_handles(phase=phase, attempt=attempt):
             self.releases.append((key, handle))
+            try:
+                self._release(handle)
+            except Exception as exc:    # noqa: BLE001 - recorded, never masking
+                # `safe_exception_text` for review F-001's reason: `self._release` is a
+                # callable supplied by the adapter and reaches the driver's own
+                # `release_target`, so the caught object is not necessarily this
+                # repository's and its `__str__` is free to raise.  A diagnostic that
+                # raised here would be the very masking this handler exists to prevent.
+                self.release_errors.append((key, handle, safe_exception_text(exc)))
+                continue
             released.append(handle)
-            self._release(handle)
         return tuple(released)
 
     def release_count(self, handle: str) -> int:
@@ -4139,6 +4197,45 @@ class OrcaRuntimeHarness:
         )
         return ticket, issued_at
 
+    def _launch_provenance(self, *, role: str, phase: str, attempt: Any
+                           ) -> tuple[str, dict[str, Any] | None, str]:
+        """What this run DURABLY RECORDED about the launch of this slot -- in THREE
+        states, not two.  PR40-B1.
+
+        `_durable_launch_lease` collapses every non-answer onto `None`, which is correct
+        for the leg that consumes it -- an unconfirmable citation is
+        `model_selection_request_absent` -- but it is NOT correct for the prior question
+        *does this target owe launch verification at all*.  That question must distinguish
+
+          * `recorded`             -- a lease IS on record for this slot; and
+          * `no_launch_recorded`   -- the document POSITIVELY states this run recorded no
+            launch for this slot.  `PairPreparationStore.launch_lease` answers `None` for
+            an absent entry and for an entry with no `launch_token`, and BOTH are that
+            positive statement, because an absent or truncated document never reaches it
+            -- `_read_document` refuses it by name first.  This is the one state that may
+            read as genuinely LEGACY; and
+          * `unreadable` / `no_reader` -- the question could not be ANSWERED.  A reader
+            failure, a corrupt record or an unwired reader is not evidence of a no-lease
+            state, and conflating the two is exactly how an empty registry came to read as
+            legacy.
+
+        Returns `(state, record, detail)`.  `record` is non-`None` only for `recorded`.
+        """
+        reader = self._launch_lease_reader
+        if not callable(reader):
+            return (LAUNCH_PROVENANCE_NO_READER, None,
+                    "no durable launch-lease reader is wired into this harness")
+        try:
+            found = reader(role=role, phase=phase, attempt=attempt)
+        except Exception as exc:        # noqa: BLE001 - unreadable is never permission
+            # `safe_exception_text`, not an eager f-string: review F-001's rule holds here
+            # too.  A diagnostic may not replace the thing it is diagnosing, and the
+            # reader is wired in from outside this module.
+            return (LAUNCH_PROVENANCE_UNREADABLE, None, safe_exception_text(exc))
+        if not isinstance(found, dict) or not found.get("launch_token"):
+            return (LAUNCH_PROVENANCE_NONE, None, "")
+        return (LAUNCH_PROVENANCE_RECORDED, found, "")
+
     def _durable_launch_lease(self, *, role: str, phase: str,
                               attempt: Any) -> dict[str, Any] | None:
         """The DURABLY RECORDED lease for this slot, through the wired reader.
@@ -4149,15 +4246,171 @@ class OrcaRuntimeHarness:
         unknown, never "it was fine": that is the same discipline
         `OrcaAdapter._assert_preparation_binding` applies to a harness that cannot state
         its own routing identity.
+
+        A thin read of `_launch_provenance` since PR40-B1, so the two consumers of the
+        durable record cannot acquire a second spelling of it.  Its own answer is
+        UNCHANGED: every state but `recorded` is `None`, exactly as before.
         """
-        reader = self._launch_lease_reader
-        if not callable(reader):
-            return None
-        try:
-            found = reader(role=role, phase=phase, attempt=attempt)
-        except Exception:               # noqa: BLE001 - unreadable is never permission
-            return None
-        return found if isinstance(found, dict) else None
+        state, record, _detail = self._launch_provenance(role=role, phase=phase,
+                                                         attempt=attempt)
+        return record if state == LAUNCH_PROVENANCE_RECORDED else None
+
+    def _launch_record_names_this_target(
+            self, record: dict[str, Any], *, terminal: str, role: str, phase: str,
+            attempt: Any) -> bool:
+        """Is this durable launch record the record OF THIS TARGET?  PR40-B1.
+
+        The ATTRIBUTION the fix rests on, and it is read off the RECORD alone -- never off
+        the registry, never off the driver's citation, never off the current capability.
+        Five cells, every one an equality over a value this run itself wrote: the run, the
+        phase, the gate iteration, the role, and the digest of the session the create
+        receipt reported.  A record that names a DIFFERENT session for the same slot -- a
+        supersession's predecessor, say -- does not make THIS handle owe anything, and
+        saying so here is what keeps the fix from refusing sessions the record is not
+        about.
+        """
+        return (record.get("terminal_digest") == pair_terminal_digest(terminal)
+                and str(record.get("run_id") or "") == (self.run_id or "")
+                and str(record.get("phase") or "") == str(phase)
+                and str(record.get("gate_iteration") or "") == str(attempt)
+                and str(record.get("role") or "") == role)
+
+    def _assert_launch_obligation(self, *, terminal: str, role: str, phase: str,
+                                  attempt: Any, command: str,
+                                  requested_model: str) -> None:
+        """PR40-B1.  Does this TARGET owe launch verification -- and can this process pay?
+
+        **The defect this closes.** Leg (a2) used to be entered on
+        `minted is not None or attested_launch_token`, i.e. the question *must this launch
+        be verified* was answered by *is there any launch evidence to hand*.  A SUCCESSOR
+        process has an empty lease registry, so `_mint_model_selection_ticket` offers
+        `launch_token=""` / `launch_stamp=0`, and a CONFORMING driver that cites what the
+        ticket tells it about returns that empty citation -- so the condition was false,
+        the whole leg was skipped BEFORE the durable lease was even read, and a session
+        this run had demonstrably launched under a lease was verified by a process holding
+        no lease and no binding for it.
+
+        **The rule it implements instead.** The obligation is read off TRUSTWORTHY
+        PREPARATION/DURABLE PROVENANCE -- this run's own record of the launch, attributed
+        to this target by run, phase, gate iteration, role and terminal digest.  If a
+        lease is on record for THIS target and this process holds no valid lease for it,
+        the delivery is refused BY NAME.  An empty citation, an empty registry and an
+        absent live target are never grounds for a legacy verdict.
+
+        **And the four things it must not do.**  It restores no binding and no authority
+        from the durable record; it mints, binds and relaunches nothing to make itself
+        pass; it attempts no rebind, relaunch or recovery of any kind; and it leaves the
+        GENUINE legacy/reference path -- `no_launch_recorded`, the document's own positive
+        statement -- exactly as it was.
+
+        Placed PRE-SELECTION, beside the two pair-admission checks, and for the same
+        reason they were hoisted there: nothing it reads comes from the driver, so no
+        ticket is minted, no ordinal is drawn and `select_and_verify()` -- the act that
+        may switch the physical session -- has not run when it refuses.
+        """
+        if self.launch_lease_for_handle(terminal) is not None:
+            # This process HOLDS the lease for this session: the obligation exists and
+            # leg (a2) below is what discharges it, check by check.  Nothing to add here.
+            return
+        if terminal in self._launch_released_handles:
+            # Already named, and named more precisely, by leg (a2-3)'s released check: the
+            # round that owned this target is over.  Left to it so no reason code moves.
+            return
+        state, record, detail = self._launch_provenance(role=role, phase=phase,
+                                                        attempt=attempt)
+        if state == LAUNCH_PROVENANCE_NONE:
+            # The ONE permissive answer, and it is permissive because it is POSITIVE: the
+            # document itself states that this run recorded no launch for this slot.  That
+            # is the genuine legacy / reference path and it stays untouched.
+            #
+            # PR40-B1, iteration 2 (review F-001).  `no_reader` used to be grouped HERE,
+            # on the reasoning that an unwired document records no launch for any slot.
+            # That reasoning is wrong and the grouping was the defect: it answered an
+            # UNANSWERED question permissively, which is the same mistake PR40-B1 is
+            # about one level up, and it contradicted `set_launch_lease_reader`'s own
+            # contract.  The two are now separated -- a positive statement is not the
+            # absence of one.
+            return
+        if state in (LAUNCH_PROVENANCE_UNREADABLE, LAUNCH_PROVENANCE_NO_READER):
+            # NEITHER is a verified no-lease state, and each is named as its own thing.
+            #
+            # Both legs are gated on HC, and that gate is the fix's whole blast radius: a
+            # harness that cannot mint a lease at all can hold none to be missing, so
+            # refusing without HC would close the legacy and reference paths on an
+            # unreadable or unwired document rather than on a launch.  With HC the
+            # opposite holds -- every create on the preparation path mints a lease and
+            # records it durably, so a hosted target this process holds no lease for is
+            # one whose provenance MUST be consulted, and a provenance that cannot be
+            # consulted is refused rather than assumed benign.
+            if not self.hosted_delivery_capable():
+                return
+            if state == LAUNCH_PROVENANCE_NO_READER:
+                # `model_selection_request_absent`, and the name is not a choice made
+                # here: `set_launch_lease_reader` has always promised exactly this one --
+                # "Leaving it unwired is FAIL-CLOSED, not permissive: with no reader the
+                # launch leg cannot confirm that a cited lease was ever durably recorded,
+                # and an unconfirmable citation is `model_selection_request_absent`."
+                # Leg (a2-2) already raises that same member when the durable read comes
+                # back unusable, so the unwired case is reported as what it is: THIS
+                # process can attest no durable launch request, whatever is on disk.
+                # Distinct from the `unreadable` leg below (`model_selection_unverified`)
+                # and distinct from the positive no-launch state above, which raises
+                # nothing at all.
+                raise self._model_refusal(
+                    MODEL_SELECTION_REQUEST_ABSENT,
+                    role=role, phase=phase, attempt=attempt, command=command,
+                    requested_model=requested_model,
+                    detail="(a2-0) this process holds no launch lease for "
+                    f"{terminal!r} and no durable launch-lease reader is wired into this "
+                    "harness, so whether this target's launch was ever recorded cannot be "
+                    "ASKED, let alone confirmed.  An unwired reader is the absence of an "
+                    "answer, never the answer 'no launch was recorded': it is fail-closed "
+                    "by this harness's own stated contract, refused here before any "
+                    "selection and before any delivery, and no lease is minted, nothing "
+                    "is bound or re-bound, no relaunch or recovery is attempted and no "
+                    "authority is restored to resolve it",
+                )
+            raise self._model_refusal(
+                MODEL_SELECTION_UNVERIFIED,
+                role=role, phase=phase, attempt=attempt, command=command,
+                requested_model=requested_model,
+                detail="(a2-0) this process holds no launch lease for "
+                f"{terminal!r} and this run's durable record of the launch could not be "
+                f"read ({detail}), so whether this target owes launch verification is "
+                "UNKNOWN.  An unreadable or corrupt record is not a verified "
+                "no-lease state and is never read as a legacy session; it is refused "
+                "here, before any selection, and no binding is restored or re-created "
+                "to resolve it",
+            )
+        if not self._launch_record_names_this_target(
+                record or {}, terminal=terminal, role=role, phase=phase, attempt=attempt):
+            return                      # the record is not about THIS session
+        if (record or {}).get("launch_revoked_at"):
+            raise self._model_refusal(
+                MODEL_SELECTION_REQUEST_STALE,
+                role=role, phase=phase, attempt=attempt, command=command,
+                requested_model=requested_model,
+                detail="(a2-0) this run's durable record stamps this session's launch as "
+                f"REVOKED at {(record or {}).get('launch_revoked_at')!r} and this process "
+                "holds no lease for it; a revoked lease is never re-exercised and a "
+                "durable record never restores one",
+            )
+        raise self._model_refusal(
+            MODEL_SELECTION_REQUEST_ABSENT,
+            role=role, phase=phase, attempt=attempt, command=command,
+            requested_model=requested_model,
+            detail="(a2-0) this run DURABLY RECORDED a launch for this very session "
+            f"({terminal!r}, {role} of {phase!r} gate iteration {attempt}) and THIS "
+            "process holds no lease and no binding for it, so it can attest no launch "
+            "request at all.  A target whose launch is on record owes verification "
+            "whatever this process's registry, the driver's citation or the current "
+            "capability happen to say -- an EMPTY citation is the absence of evidence, "
+            "never evidence of absence.  A SUCCESSOR process reaches this, and correctly: "
+            "its registry is empty, so a durable lease it did not mint is not a launch it "
+            "can revalidate.  The state is NAMED, never repaired: no lease is minted, "
+            "nothing is re-bound, no relaunch and no recovery is attempted, and the "
+            "durable record stays exactly as it was found",
+        )
 
     def _revoke_model_selection_ticket(self, ticket: ModelSelectionTicket) -> None:
         """Close the stamp window. Called in a `finally:`, so a raising driver cannot
@@ -4683,7 +4936,9 @@ class OrcaRuntimeHarness:
         # BOTH halves of pair admission are that kind of check, and both are decided
         # here. (Iteration 1 hoisted only the first and its comment claimed that was "the
         # only one in this method"; final review R2 showed the claim was false and the
-        # second one is corrected along with it.)
+        # second one is corrected along with it.)  PR40-B1 adds a THIRD check of the same
+        # kind -- the LAUNCH OBLIGATION -- for the same reason, so this region is now
+        # three checks rather than two.
         #
         #   1. the SESSION conflict -- `counterpart.observed_at_terminal` vs `terminal`,
         #      two harness-held strings compared for equality.
@@ -4692,6 +4947,10 @@ class OrcaRuntimeHarness:
         #      `resolved` and `command` against this `command`. Every one of them is
         #      harness state or a parameter of this call; not one is produced by the
         #      driver.
+        #   3. the LAUNCH OBLIGATION (PR40-B1) -- this run's own DURABLE record of the
+        #      launch of this target, against this harness's own lease registry. Both are
+        #      harness state or this run's own durable record; not one byte of it is
+        #      produced by the driver.
         #
         # The two differ in ONE respect, and deliberately. Check 1 is UNGATED by
         # `require_pair_admission` (review M5, unchanged): the defect it closes is
@@ -4760,6 +5019,17 @@ class OrcaRuntimeHarness:
                     "Verify both effective identities with verify_model_identity() "
                     "before delivering either",
                 )
+        #   3. PR40-B1: the LAUNCH OBLIGATION -- does this TARGET owe launch
+        #      verification, read off this run's own durable provenance rather than off
+        #      the registry, the driver's citation or the current capability.  It belongs
+        #      here for the same reason as the two above: every value it reads is this
+        #      harness's own state or this run's own durable record, so it can refuse
+        #      before a ticket exists and before `select_and_verify()` -- the act that may
+        #      switch the physical session -- has run.  Leg (a2) below remains in full and
+        #      is what discharges the obligation when this process DOES hold the lease.
+        self._assert_launch_obligation(
+            terminal=terminal, role=role, phase=phase, attempt=attempt, command=command,
+            requested_model=requested)
         ticket, issued_at = self._mint_model_selection_ticket(
             task_id=task_id,
             terminal=terminal,
@@ -5187,6 +5457,12 @@ class OrcaRuntimeHarness:
             #
             # A run with NO lease and an evidence that cites none skips the leg entirely,
             # which is what keeps every legacy and reference-driver run byte-identical.
+            # PR40-B1: "no lease and no citation" is no longer taken as a LICENCE to skip
+            # -- `_assert_launch_obligation`, pre-selection, has already refused the case
+            # where this run's durable record says the target WAS launched and this
+            # process cannot attest it. What reaches here with neither is a target no
+            # provenance obliges, which is exactly the genuine legacy case this skip is
+            # for.
             minted = self.launch_lease_for_handle(terminal)
             released_token = self._launch_released_handles.get(terminal)
             if minted is None and released_token is not None:
